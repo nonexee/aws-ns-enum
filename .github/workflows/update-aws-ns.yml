@@ -1,7 +1,6 @@
 name: Update AWS Nameservers
 
 on:
-  # Run on a schedule (daily at midnight UTC) and on manual trigger.
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
@@ -42,3 +41,13 @@ jobs:
         with:
           name: aws_ns_servers.txt
           path: aws_ns_servers.txt
+
+      # --- New step to commit the file back to the repo ---
+      - name: Commit updated nameservers file
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: "Update aws_ns_servers.txt"
+          add: "aws_ns_servers.txt"
+          # Optional: set the commit author
+          author_name: "github-actions"
+          author_email: "github-actions@github.com"
