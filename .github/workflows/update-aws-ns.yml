@@ -15,6 +15,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           persist-credentials: true
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -46,12 +47,63 @@ jobs:
           name: aws_ns_servers.txt
           path: aws_ns_servers.txt
 
-      # --- New step to commit the file back to the repo ---
       - name: Commit updated nameservers file
         uses: EndBug/add-and-commit@v9
         with:
           message: "Update aws_ns_servers.txt"
           add: "aws_ns_servers.txt"
-          # Optional: set the commit author
           author_name: "github-actions"
           author_email: "github-actions@github.com"
+
+      # ----- Resolve domains to IPs -----
+      - name: Resolve domains to IPs
+        run: |
+          echo "[*] Resolving domains from aws_ns_servers.txt to IPv4 addresses..."
+          rm -f aws_ns_ips.txt
+          while IFS= read -r domain; do
+            [ -z "$domain" ] && continue
+            # Resolve the domain using dig and output A records
+            dig +short A "$domain"
+          done < aws_ns_servers.txt | sort -u > aws_ns_ips.txt
+          echo "[*] Unique IPs written to aws_ns_ips.txt:"
+          cat aws_ns_ips.txt
+
+      # ----- Run masscan via Docker on port 53 -----
+      - name: Run masscan for port 53
+        run: |
+          echo "[*] Running masscan on port 53..."
+          docker run --rm \
+            -v "${{ github.workspace }}":/data \
+            ilyaglow/masscan \
+            -p53 \
+            -iL /data/aws_ns_ips.txt \
+            -oL /data/open53.txt \
+            --wait 10
+
+      # ----- Extract open port 53 IPs -----
+      - name: Extract open port 53 IPs
+        run: |
+          echo "[*] Extracting IPs with port 53 open..."
+          grep '^open tcp 53 ' open53.txt | awk '{print $4}' | sort -u > aws_ns_ips_53.txt
+          echo "[*] IPs with port 53 open (aws_ns_ips_53.txt):"
+          cat aws_ns_ips_53.txt
+
+      - name: Commit scan results
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: "Update scan results for port 53"
+          add: |
+            aws_ns_ips.txt
+            open53.txt
+            aws_ns_ips_53.txt
+          author_name: "github-actions"
+          author_email: "github-actions@github.com"
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scan Results
+          path: |
+            aws_ns_ips.txt
+            open53.txt
+            aws_ns_ips_53.txt
