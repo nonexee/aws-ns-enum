@@ -1,0 +1,44 @@
+name: Update AWS Nameservers
+
+on:
+  # Run on a schedule (daily at midnight UTC) and on manual trigger.
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-ns:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Generate candidate hostnames
+        run: |
+          python generate_candidates.py
+          echo "Generated $(wc -l < aws_candidates.txt) candidate hostnames."
+
+      - name: Create resolvers file
+        run: |
+          echo "8.8.8.8" > resolvers.txt
+          echo "8.8.4.4" >> resolvers.txt
+
+      - name: Run puredns to resolve candidates
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/current \
+            secsi/puredns resolve \
+            -r /current/resolvers.txt \
+            /current/aws_candidates.txt \
+            --write /current/aws_ns_servers.txt
+
+      - name: Upload live nameservers file as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: aws_ns_servers.txt
+          path: aws_ns_servers.txt
