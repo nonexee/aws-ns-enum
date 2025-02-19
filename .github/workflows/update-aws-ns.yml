@@ -38,7 +38,7 @@ jobs:
             --write /current/aws_ns_servers.txt
 
       - name: Upload live nameservers file as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: aws_ns_servers.txt
           path: aws_ns_servers.txt
