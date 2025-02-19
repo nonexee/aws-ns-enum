@@ -32,6 +32,7 @@ jobs:
           docker run --rm \
             -v "${{ github.workspace }}":/current \
             secsi/puredns resolve \
+            -q \
             -r /current/resolvers.txt \
             /current/aws_candidates.txt \
             --write /current/aws_ns_servers.txt
