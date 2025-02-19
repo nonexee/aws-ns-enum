@@ -16,6 +16,10 @@ jobs:
         with:
           persist-credentials: true
 
+      - name: Adjust workspace permissions
+        run: |
+          chmod -R 777 "${{ github.workspace }}"
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
