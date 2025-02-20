@@ -27,7 +27,7 @@ jobs:
       - name: Create dynamic matrix JSON
         id: set-matrix
         run: |
-          # Read the file and produce a JSON array of ranges
+          # Read the file as a JSON array (each non-empty line becomes an element)
           matrix=$(jq -R -s -c 'split("\n") | map(select(length > 0))' ec2_ranges.txt)
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
 
@@ -41,30 +41,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Create folder for range ${{ matrix.cidr }}
+      - name: Set folder name for ${{ matrix.cidr }}
+        id: folder
         run: |
-          # Replace '/' and '.' with safe characters for folder naming
+          # Replace "/" and "." with underscores to create a safe folder name
           folder=$(echo "${{ matrix.cidr }}" | tr '/.' '__')
-          mkdir -p open_ips/$folder certs/$folder
+          echo "folder=$folder" >> $GITHUB_OUTPUT
+
+      - name: Create folders for range
+        run: |
+          mkdir -p open_ips/${{ steps.folder.outputs.folder }}
+          mkdir -p certs/${{ steps.folder.outputs.folder }}
 
       - name: Scan ${{ matrix.cidr }} with ZMap
         run: |
-          folder=$(echo "${{ matrix.cidr }}" | tr '/.' '__')
           echo "Scanning range: ${{ matrix.cidr }}"
           docker run --rm --network=host -v "${{ github.workspace }}":/data sec32/zmap \
             zmap -M tcp_synscan -p 443 -B 100K "${{ matrix.cidr }}" \
-            -o /data/open_ips/${folder}/open_ips.csv
+            -o /data/open_ips/${{ steps.folder.outputs.folder }}/open_ips.csv
 
       - name: Grab TLS certs with ZGrab2 for ${{ matrix.cidr }}
         run: |
-          folder=$(echo "${{ matrix.cidr }}" | tr '/.' '__')
           docker run --rm --network=host -v "${{ github.workspace }}":/data -i sec32/zgrab2 \
             zgrab2 tls --port 443 \
-            --input-file=/data/open_ips/${folder}/open_ips.csv \
-            --output-file=/data/certs/${folder}/certs.json
+            --input-file=/data/open_ips/${{ steps.folder.outputs.folder }}/open_ips.csv \
+            --output-file=/data/certs/${{ steps.folder.outputs.folder }}/certs.json
 
       - name: Upload artifact for ${{ matrix.cidr }}
         uses: actions/upload-artifact@v4
         with:
-          name: certs-${{ replace(replace(matrix.cidr, '/', '-'), '.', '_') }}
-          path: certs/${{ replace(replace(matrix.cidr, '/', '-'), '.', '_') }}/certs.json
+          name: certs-${{ matrix.cidr }}
+          path: certs/${{ steps.folder.outputs.folder }}/certs.json
