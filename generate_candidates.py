@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
-"""
-This script generates potential AWS nameserver hostnames based on a pattern:
-    ns-<server_num>.awsdns-<pool_num>.<tld>
-and writes them to aws_candidates.txt.
-"""
+import json
+import ipaddress
+import urllib.request
 
-import itertools
+def main():
+    url = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+    print(f"Fetching AWS IP ranges from {url} ...")
+    with urllib.request.urlopen(url) as response:
+        data = json.load(response)
 
-# Configuration: adjust these ranges as needed.
-SERVER_NUM_START = 1
-SERVER_NUM_END = 10000    # Generates ns-1 ... ns-6000
-POOL_NUM_START = 1
-POOL_NUM_END = 101        # Generates awsdns-1 ... awsdns-20
-TLDs = ["org", "com", "net", "co.uk"]
+    # Filter for prefixes where service == "ROUTE53"
+    route53_prefixes = [
+        item["ip_prefix"]
+        for item in data.get("prefixes", [])
+        if item.get("service") == "ROUTE53"
+    ]
+    
+    print("Found the following Route53 prefixes:")
+    for prefix in route53_prefixes:
+        print("  ", prefix)
 
-output_file = "aws_candidates.txt"
+    # Enumerate all IP addresses from each prefix
+    ips = []
+    for prefix in route53_prefixes:
+        network = ipaddress.ip_network(prefix)
+        ips.extend(str(ip) for ip in network)
+    
+    # Write IPs to file
+    output_file = "aws_route53_ips.txt"
+    with open(output_file, "w") as f:
+        for ip in ips:
+            f.write(ip + "\n")
+    
+    print(f"Generated {len(ips)} IPs from Route53 ranges and wrote them to {output_file}")
 
-with open(output_file, "w") as f:
-    for server, pool, tld in itertools.product(range(SERVER_NUM_START, SERVER_NUM_END),
-                                                 range(POOL_NUM_START, POOL_NUM_END),
-                                                 TLDs):
-        hostname = f"ns-{server}.awsdns-{pool}.{tld}"
-        f.write(hostname + "\n")
+if __name__ == "__main__":
+    main()
