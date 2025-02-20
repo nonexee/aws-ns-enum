@@ -25,29 +25,38 @@ jobs:
       - name: Split ranges into chunks
         id: split-ranges
         run: |
-          # Read ranges into array and split into chunks of 200
-          readarray -t ranges < ec2_ranges.txt
-          chunks=()
-          current_chunk=()
+          # Initialize empty arrays
+          declare -a chunks
+          declare -a current_chunk
           count=0
           
-          for range in "${ranges[@]}"; do
-            if [ -z "$range" ]; then
-              continue
-            fi
+          # Read file line by line
+          while IFS= read -r range || [ -n "$range" ]; do
+            # Skip empty lines
+            [ -z "$range" ] && continue
+            
+            # Add range to current chunk
             current_chunk+=("$range")
             ((count++))
             
-            if [ $count -eq 200 ] || [ "$range" = "${ranges[-1]}" ]; then
+            # When chunk is full or at last line
+            if [ $count -eq 200 ] || [ ! -n "$(tail -n +$((count+1)) ec2_ranges.txt)" ]; then
+              # Convert current chunk to JSON and add to chunks array
               chunk_json=$(printf '%s\n' "${current_chunk[@]}" | jq -R . | jq -s .)
               chunks+=("$chunk_json")
+              
+              # Reset current chunk
               current_chunk=()
               count=0
             fi
-          done
+          done < ec2_ranges.txt
           
+          # Convert all chunks to JSON array and escape for GitHub Actions
           chunks_json=$(printf '%s\n' "${chunks[@]}" | jq -s .)
-          echo "chunks=${chunks_json}" >> $GITHUB_OUTPUT
+          echo "chunks<<EOF" >> $GITHUB_OUTPUT
+          echo "$chunks_json" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
           echo "Created $(echo "$chunks_json" | jq length) chunks of ranges"
 
   trigger-chunk-scans:
@@ -64,11 +73,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          readarray -t ranges <<< "$(echo '${{ toJSON(matrix.chunk) }}' | jq -r '.[]')"
-          
-          for range in "${ranges[@]}"; do
+          for range in $(echo '${{ toJSON(matrix.chunk) }}' | jq -r '.[]'); do
             echo "Triggering scan for range: $range"
             gh workflow run scan-single-range.yml -f ip_range="$range"
-            # Small delay to avoid overwhelming GitHub API
             sleep 2
           done
