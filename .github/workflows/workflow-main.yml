@@ -24,40 +24,48 @@ jobs:
 
       - name: Split ranges into chunks
         id: split-ranges
+        shell: bash
         run: |
-          # Initialize empty arrays
+          # Create arrays
           declare -a chunks
           declare -a current_chunk
+
+          # Initialize counter
           count=0
-          
-          # Read file line by line
-          while IFS= read -r range || [ -n "$range" ]; do
+
+          # Process file line by line
+          while IFS= read -r range; do
             # Skip empty lines
             [ -z "$range" ] && continue
             
-            # Add range to current chunk
-            current_chunk+=("$range")
+            # Add to current chunk
+            current_chunk[$count]="$range"
             ((count++))
             
-            # When chunk is full or at last line
-            if [ $count -eq 200 ] || [ ! -n "$(tail -n +$((count+1)) ec2_ranges.txt)" ]; then
-              # Convert current chunk to JSON and add to chunks array
+            # When chunk is full or last line
+            if [ $count -eq 200 ] || [ ! -s <(tail -n+$((count+1)) ec2_ranges.txt) ]; then
+              # Convert current chunk to JSON
               chunk_json=$(printf '%s\n' "${current_chunk[@]}" | jq -R . | jq -s .)
               chunks+=("$chunk_json")
               
-              # Reset current chunk
-              current_chunk=()
+              # Reset for next chunk
+              unset current_chunk
+              declare -a current_chunk
               count=0
             fi
           done < ec2_ranges.txt
-          
-          # Convert all chunks to JSON array and escape for GitHub Actions
+
+          # Create final JSON output
           chunks_json=$(printf '%s\n' "${chunks[@]}" | jq -s .)
-          echo "chunks<<EOF" >> $GITHUB_OUTPUT
-          echo "$chunks_json" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
           
-          echo "Created $(echo "$chunks_json" | jq length) chunks of ranges"
+          {
+            echo "chunks<<EOF"
+            echo "$chunks_json"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+          
+          total_chunks=$(echo "$chunks_json" | jq length)
+          echo "Created $total_chunks chunks of ranges"
 
   trigger-chunk-scans:
     needs: prepare
@@ -73,7 +81,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for range in $(echo '${{ toJSON(matrix.chunk) }}' | jq -r '.[]'); do
+          echo '${{ toJSON(matrix.chunk) }}' | jq -r '.[]' | while read -r range; do
             echo "Triggering scan for range: $range"
             gh workflow run scan-single-range.yml -f ip_range="$range"
             sleep 2
