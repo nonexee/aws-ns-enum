@@ -1,4 +1,4 @@
-name: Update AWS Nameservers
+name: Update AWS Route53 IPs and Scan Port 53
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  update-ns:
+  update-route53:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,74 +17,43 @@ jobs:
           persist-credentials: true
 
       - name: Adjust workspace permissions
-        run: |
-          chmod -R 777 "${{ github.workspace }}"
+        run: chmod -R 777 "${{ github.workspace }}"
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
 
-      - name: Generate candidate hostnames
+      - name: Generate AWS Route53 IPs
         run: |
           python generate_candidates.py
-          echo "Generated $(wc -l < aws_candidates.txt) candidate hostnames."
+          echo "Generated $(wc -l < aws_route53_ips.txt) IPs from Route53 ranges."
 
-      - name: Create resolvers file
-        run: |
-          echo "8.8.8.8" > resolvers.txt
-          echo "8.8.4.4" >> resolvers.txt
-
-      - name: Run puredns to resolve candidates
-        run: |
-          docker run --rm \
-            -v "${{ github.workspace }}":/current \
-            secsi/puredns resolve \
-            -q \
-            -r /current/resolvers.txt \
-            /current/aws_candidates.txt \
-            --write /current/aws_ns_servers.txt
-
-      - name: Upload live nameservers file as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: aws_ns_servers.txt
-          path: aws_ns_servers.txt
-
-      - name: Commit updated nameservers file
+      - name: Commit Route53 IPs file
         uses: EndBug/add-and-commit@v9
         with:
-          message: "Update aws_ns_servers.txt"
-          add: "aws_ns_servers.txt"
+          message: "Update aws_route53_ips.txt"
+          add: "aws_route53_ips.txt"
           author_name: "github-actions"
           author_email: "github-actions@github.com"
 
-      # ----- Resolve domains to IPs -----
-      - name: Resolve domains to IPs
-        run: |
-          echo "[*] Resolving domains from aws_ns_servers.txt to IPv4 addresses..."
-          rm -f aws_ns_ips.txt
-          while IFS= read -r domain; do
-            [ -z "$domain" ] && continue
-            # Resolve the domain using dig and output A records
-            dig +short A "$domain"
-          done < aws_ns_servers.txt | sort -u > aws_ns_ips.txt
-          echo "[*] Unique IPs written to aws_ns_ips.txt:"
-          cat aws_ns_ips.txt
+      - name: Upload Route53 IPs file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aws_route53_ips.txt
+          path: aws_route53_ips.txt
 
-      # ----- Run masscan via Docker on port 53 -----
       - name: Run masscan for port 53
         run: |
-          echo "[*] Running masscan on port 53..."
+          echo "[*] Running masscan on port 53 for Route53 IPs..."
           docker run --rm \
             -v "${{ github.workspace }}":/data \
             ilyaglow/masscan \
             -p53 \
-            -iL /data/aws_ns_ips.txt \
+            -iL /data/aws_route53_ips.txt \
             -oL /data/open53.txt \
             --wait 10
 
-      # ----- Extract open port 53 IPs -----
       - name: Extract open port 53 IPs
         run: |
           echo "[*] Extracting IPs with port 53 open..."
@@ -95,9 +64,9 @@ jobs:
       - name: Commit scan results
         uses: EndBug/add-and-commit@v9
         with:
-          message: "Update scan results for port 53"
+          message: "Update scan results for Route53 port 53"
           add: |
-            aws_ns_ips.txt
+            aws_route53_ips.txt
             open53.txt
             aws_ns_ips_53.txt
           author_name: "github-actions"
@@ -108,6 +77,6 @@ jobs:
         with:
           name: Scan Results
           path: |
-            aws_ns_ips.txt
+            aws_route53_ips.txt
             open53.txt
             aws_ns_ips_53.txt
