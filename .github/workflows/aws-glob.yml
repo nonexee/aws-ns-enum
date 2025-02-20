@@ -1,0 +1,50 @@
+name: Scan AWS Global Accelerator IPs
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 0 * * *" # Runs daily at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  scan-ips:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+        with:
+          persist-credentials: true
+
+      - name: Adjust workspace permissions
+        run: chmod -R 777 "${{ github.workspace }}"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq prips
+
+      - name: Fetch AWS Global Accelerator IPs
+        run: |
+          URL="https://ip-ranges.amazonaws.com/ip-ranges.json"
+          OUTPUT_FILE="aws_globalaccelerator_ips.txt"
+          curl -s $URL | jq -r '.prefixes[] | select(.service == "GLOBALACCELERATOR") | .ip_prefix' | while read cidr; do
+              prips $cidr >> $OUTPUT_FILE
+          done
+          sort -u -o $OUTPUT_FILE $OUTPUT_FILE
+
+      - name: Run masscan on AWS Global Accelerator IPs
+        run: |
+          docker run --rm -v "${{ github.workspace }}":/data ilyaglow/masscan -p53 -iL /data/aws_globalaccelerator_ips.txt -oL /data/53.txt
+
+      - name: Extract IPs with open port 53
+        run: |
+          grep '^open tcp 53 ' 53.txt | awk '{print $4}' | sort -u > globacc_ips.txt
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: open-port-53-ips
+          path: globacc_ips.txt
