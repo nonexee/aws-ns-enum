@@ -1,0 +1,52 @@
+name: Scan Single EC2 Range
+
+on:
+  workflow_call:
+    inputs:
+      ip_range:
+        required: true
+        type: string
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+
+      - name: Adjust workspace permissions
+        run: chmod -R 777 "${{ github.workspace }}"
+
+      - name: Create range directory
+        run: |
+          RANGE_DIR="${{ github.workspace }}/results/${{ inputs.ip_range }}"
+          mkdir -p "$RANGE_DIR"
+          echo "RANGE_DIR=$RANGE_DIR" >> $GITHUB_ENV
+
+      - name: Scan range with ZMap
+        run: |
+          docker run --rm --network=host -v "${{ github.workspace }}":/data \
+            sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
+            "${{ inputs.ip_range }}" -o /data/open_ips.csv
+
+      - name: Run ZGrab2 for range
+        run: |
+          docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
+            sec32/zgrab2 zgrab2 tls --port 443 \
+            --input-file=/data/open_ips.csv \
+            --output-file=/data/certs.json
+
+      - name: Move results to range directory
+        run: |
+          mv "${{ github.workspace }}/open_ips.csv" "${{ env.RANGE_DIR }}/"
+          mv "${{ github.workspace }}/certs.json" "${{ env.RANGE_DIR }}/"
+
+      - name: Commit and push results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add "${{ env.RANGE_DIR }}"
+          git commit -m "Add scan results for range ${{ inputs.ip_range }}"
+          git push
