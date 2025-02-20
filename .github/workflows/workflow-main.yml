@@ -7,7 +7,7 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      ranges: ${{ steps.split-ranges.outputs.ranges }}
+      range_chunks: ${{ steps.split-ranges.outputs.chunks }}
     
     steps:
       - name: Install dependencies
@@ -19,25 +19,56 @@ jobs:
         run: |
           curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | \
           jq -r '.prefixes[] | select(.service=="EC2") | .ip_prefix' > ec2_ranges.txt
-          
           echo "Found EC2 ranges:"
           cat ec2_ranges.txt
 
-      - name: Split ranges into array
+      - name: Split ranges into chunks
         id: split-ranges
         run: |
-          RANGES=$(cat ec2_ranges.txt | jq -R -s -c 'split("\n")[:-1]')
-          echo "ranges=${RANGES}" >> $GITHUB_OUTPUT
+          # Read ranges into array and split into chunks of 200
+          readarray -t ranges < ec2_ranges.txt
+          chunks=()
+          current_chunk=()
+          count=0
+          
+          for range in "${ranges[@]}"; do
+            if [ -z "$range" ]; then
+              continue
+            fi
+            current_chunk+=("$range")
+            ((count++))
+            
+            if [ $count -eq 200 ] || [ "$range" = "${ranges[-1]}" ]; then
+              chunk_json=$(printf '%s\n' "${current_chunk[@]}" | jq -R . | jq -s .)
+              chunks+=("$chunk_json")
+              current_chunk=()
+              count=0
+            fi
+          done
+          
+          chunks_json=$(printf '%s\n' "${chunks[@]}" | jq -s .)
+          echo "chunks=${chunks_json}" >> $GITHUB_OUTPUT
+          echo "Created $(echo "$chunks_json" | jq length) chunks of ranges"
 
-  scan-ranges:
+  trigger-chunk-scans:
     needs: prepare
     strategy:
       matrix:
-        range: ${{ fromJson(needs.prepare.outputs.ranges) }}
-      # Allow parallel jobs and continue on error
+        chunk: ${{ fromJson(needs.prepare.outputs.range_chunks) }}
       max-parallel: 5
       fail-fast: false
     
-    uses: ./.github/workflows/scan-single-range.yml
-    with:
-      ip_range: ${{ matrix.range }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger scans for chunk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          readarray -t ranges <<< "$(echo '${{ toJSON(matrix.chunk) }}' | jq -r '.[]')"
+          
+          for range in "${ranges[@]}"; do
+            echo "Triggering scan for range: $range"
+            gh workflow run scan-single-range.yml -f ip_range="$range"
+            # Small delay to avoid overwhelming GitHub API
+            sleep 2
+          done
