@@ -1,4 +1,4 @@
-name: Update AWS Route53 IPs and Scan Port 53
+name: Update AWS Route53 Open Port 53 IPs
 
 on:
   schedule:
@@ -24,28 +24,30 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Generate AWS Route53 IPs
+      # Generate Route53 IPs inline without storing any intermediate files in the repo.
+      - name: Generate AWS Route53 IPs inline
         run: |
-          python generate_candidates.py
-          echo "Generated $(wc -l < aws_route53_ips.txt) IPs from Route53 ranges."
+          python - <<'EOF'
+          import json, ipaddress, urllib.request
+          url = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+          data = json.load(urllib.request.urlopen(url))
+          # Filter prefixes for Route53 service.
+          route53_prefixes = [item["ip_prefix"] for item in data.get("prefixes", []) if item.get("service") == "ROUTE53"]
+          ips = []
+          for prefix in route53_prefixes:
+              network = ipaddress.ip_network(prefix)
+              ips.extend(str(ip) for ip in network)
+          # Write full list to an intermediate file.
+          with open("aws_route53_ips.txt", "w") as f:
+              for ip in ips:
+                  f.write(ip + "\n")
+          print(f"Generated {len(ips)} IPs from Route53 ranges.")
+          EOF
 
-      - name: Commit Route53 IPs file
-        uses: EndBug/add-and-commit@v9
-        with:
-          message: "Update aws_route53_ips.txt"
-          add: "aws_route53_ips.txt"
-          author_name: "github-actions"
-          author_email: "github-actions@github.com"
-
-      - name: Upload Route53 IPs file as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: aws_route53_ips.txt
-          path: aws_route53_ips.txt
-
+      # Run Masscan on the full list to check port 53.
       - name: Run masscan for port 53
         run: |
-          echo "[*] Running masscan on port 53 for Route53 IPs..."
+          echo "[*] Running masscan on port 53..."
           docker run --rm \
             -v "${{ github.workspace }}":/data \
             ilyaglow/masscan \
@@ -54,29 +56,24 @@ jobs:
             -oL /data/open53.txt \
             --wait 10
 
+      # Extract only the IPs with port 53 open.
       - name: Extract open port 53 IPs
         run: |
           echo "[*] Extracting IPs with port 53 open..."
           grep '^open tcp 53 ' open53.txt | awk '{print $4}' | sort -u > aws_ns_ips_53.txt
-          echo "[*] IPs with port 53 open (aws_ns_ips_53.txt):"
+          echo "[*] Final list (aws_ns_ips_53.txt):"
           cat aws_ns_ips_53.txt
 
-      - name: Commit scan results
+      # Clean up intermediate files so only the final file remains in the repo.
+      - name: Remove intermediate files
+        run: |
+          rm -f aws_route53_ips.txt open53.txt
+
+      # Commit only the final file into the repository.
+      - name: Commit final scan result
         uses: EndBug/add-and-commit@v9
         with:
-          message: "Update scan results for Route53 port 53"
-          add: |
-            aws_route53_ips.txt
-            open53.txt
-            aws_ns_ips_53.txt
+          message: "Update aws_ns_ips_53.txt with open port 53 IPs"
+          add: "aws_ns_ips_53.txt"
           author_name: "github-actions"
           author_email: "github-actions@github.com"
-
-      - name: Upload scan artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: Scan Results
-          path: |
-            aws_route53_ips.txt
-            open53.txt
-            aws_ns_ips_53.txt
