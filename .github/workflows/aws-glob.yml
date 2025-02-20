@@ -44,7 +44,7 @@ jobs:
           grep '^open tcp 53 ' 53.txt | awk '{print $4}' | sort -u > globacc_ips.txt
 
       - name: Upload results as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: open-port-53-ips
           path: globacc_ips.txt
