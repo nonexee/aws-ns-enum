@@ -1,0 +1,53 @@
+name: Setup EC2 Ranges
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-ranges:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Download and process EC2 IP ranges
+        run: |
+          # Download ranges
+          curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | \
+          jq -r '.prefixes[] | select(.service=="EC2") | .ip_prefix' > ec2_ranges.txt
+          
+          # Create directories for each range
+          while IFS= read -r range; do
+            # Skip empty lines
+            [ -z "$range" ] && continue
+            
+            # Create safe directory name (replace / with _)
+            dir_name=$(echo "$range" | tr '/' '_')
+            
+            # Create directory if it doesn't exist
+            mkdir -p "ranges/$dir_name"
+            
+            # Store CIDR range in a file within the directory
+            echo "$range" > "ranges/$dir_name/cidr.txt"
+            
+            echo "Created directory for range: $range"
+          done < ec2_ranges.txt
+          
+          # Store total count
+          total_ranges=$(grep -c . ec2_ranges.txt)
+          echo "Total EC2 ranges processed: $total_ranges"
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add ranges/
+          git commit -m "Setup EC2 range directories"
+          git push
