@@ -66,5 +66,5 @@ jobs:
       - name: Upload artifact for ${{ matrix.cidr }}
         uses: actions/upload-artifact@v4
         with:
-          name: certs-${{ matrix.cidr | replace("/", "-") | replace(".", "_") }}
-          path: certs/${{ matrix.cidr | replace("/", "-") | replace(".", "_") }}/certs.json
+          name: certs-${{ replace(replace(matrix.cidr, '/', '-'), '.', '_') }}
+          path: certs/${{ replace(replace(matrix.cidr, '/', '-'), '.', '_') }}/certs.json
