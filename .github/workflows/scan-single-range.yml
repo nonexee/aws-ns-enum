@@ -1,7 +1,7 @@
 name: Scan Single EC2 Range
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       ip_range:
         required: true
@@ -15,38 +15,46 @@ jobs:
         uses: actions/checkout@v3
         with:
           persist-credentials: true
+          fetch-depth: 0
 
-      - name: Adjust workspace permissions
-        run: chmod -R 777 "${{ github.workspace }}"
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          # Pull latest to avoid conflicts
+          git pull origin main
 
-      - name: Create range directory
+      - name: Setup range directory
         run: |
           RANGE_DIR="${{ github.workspace }}/results/${{ inputs.ip_range }}"
           mkdir -p "$RANGE_DIR"
           echo "RANGE_DIR=$RANGE_DIR" >> $GITHUB_ENV
 
-      - name: Scan range with ZMap
+      - name: Scan with ZMap
         run: |
           docker run --rm --network=host -v "${{ github.workspace }}":/data \
             sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
             "${{ inputs.ip_range }}" -o /data/open_ips.csv
 
-      - name: Run ZGrab2 for range
+      - name: Commit ZMap results
+        run: |
+          mv open_ips.csv "${{ env.RANGE_DIR }}/"
+          git add "${{ env.RANGE_DIR }}/open_ips.csv"
+          git commit -m "Add ZMap results for range ${{ inputs.ip_range }}"
+          git pull --rebase origin main
+          git push origin main
+
+      - name: Run ZGrab2
         run: |
           docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
             sec32/zgrab2 zgrab2 tls --port 443 \
-            --input-file=/data/open_ips.csv \
+            --input-file="${{ env.RANGE_DIR }}/open_ips.csv" \
             --output-file=/data/certs.json
 
-      - name: Move results to range directory
+      - name: Commit ZGrab2 results
         run: |
-          mv "${{ github.workspace }}/open_ips.csv" "${{ env.RANGE_DIR }}/"
-          mv "${{ github.workspace }}/certs.json" "${{ env.RANGE_DIR }}/"
-
-      - name: Commit and push results
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add "${{ env.RANGE_DIR }}"
-          git commit -m "Add scan results for range ${{ inputs.ip_range }}"
-          git push
+          mv certs.json "${{ env.RANGE_DIR }}/"
+          git add "${{ env.RANGE_DIR }}/certs.json"
+          git commit -m "Add ZGrab2 results for range ${{ inputs.ip_range }}"
+          git pull --rebase origin main
+          git push origin main
