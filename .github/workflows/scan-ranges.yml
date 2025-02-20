@@ -1,0 +1,75 @@
+name: Scan EC2 Ranges
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan-ranges:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+
+      - name: Adjust workspace permissions
+        run: chmod -R 777 "${{ github.workspace }}"
+
+      - name: Find and process unscanned ranges
+        run: |
+          # Function to process a single range
+          process_range() {
+            local dir_path=$1
+            local range_file="$dir_path/cidr.txt"
+            local cert_file="$dir_path/certs.json"
+            
+            # Skip if certs.json already exists
+            if [ -f "$cert_file" ]; then
+              echo "Skipping $dir_path - already processed"
+              return 0
+            }
+            
+            # Read CIDR range
+            local cidr=$(cat "$range_file")
+            echo "Processing range: $cidr"
+            
+            # Run ZMap scan
+            docker run --rm --network=host -v "${{ github.workspace }}":/data \
+              sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
+              "$cidr" -o /data/temp_open_ips.csv
+            
+            # Only proceed with ZGrab2 if ZMap found any IPs
+            if [ -s "${{ github.workspace }}/temp_open_ips.csv" ]; then
+              # Run ZGrab2
+              docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
+                sec32/zgrab2 zgrab2 tls --port 443 \
+                --input-file=/data/temp_open_ips.csv \
+                --output-file="$cert_file"
+              
+              echo "Completed scanning range: $cidr"
+              
+              # Commit results
+              git add "$cert_file"
+              git commit -m "Add scan results for range $cidr"
+              git push
+            else
+              echo "No open ports found for range: $cidr"
+              # Create empty results file to mark as processed
+              echo '{"results":[]}' > "$cert_file"
+              git add "$cert_file"
+              git commit -m "No results found for range $cidr"
+              git push
+            fi
+            
+            # Cleanup
+            rm -f "${{ github.workspace }}/temp_open_ips.csv"
+          }
+          
+          # Setup git
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Process each range directory
+          for dir in ranges/*/; do
+            process_range "$dir"
+          done
