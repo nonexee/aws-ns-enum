@@ -1,0 +1,43 @@
+name: EC2 TLS Scanner Orchestrator
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      ranges: ${{ steps.split-ranges.outputs.ranges }}
+    
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Download and process EC2 IP ranges
+        run: |
+          curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | \
+          jq -r '.prefixes[] | select(.service=="EC2") | .ip_prefix' > ec2_ranges.txt
+          
+          echo "Found EC2 ranges:"
+          cat ec2_ranges.txt
+
+      - name: Split ranges into array
+        id: split-ranges
+        run: |
+          RANGES=$(cat ec2_ranges.txt | jq -R -s -c 'split("\n")[:-1]')
+          echo "ranges=${RANGES}" >> $GITHUB_OUTPUT
+
+  scan-ranges:
+    needs: prepare
+    strategy:
+      matrix:
+        range: ${{ fromJson(needs.prepare.outputs.ranges) }}
+      # Allow parallel jobs and continue on error
+      max-parallel: 5
+      fail-fast: false
+    
+    uses: ./.github/workflows/scan-single-range.yml
+    with:
+      ip_range: ${{ matrix.range }}
