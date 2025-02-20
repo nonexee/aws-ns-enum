@@ -34,7 +34,7 @@ jobs:
           count=0
 
           # Process file line by line
-          while IFS= read -r range; do
+          while IFS= read -r range || [ -n "$range" ]; do
             # Skip empty lines
             [ -z "$range" ] && continue
             
@@ -42,8 +42,8 @@ jobs:
             current_chunk[$count]="$range"
             ((count++))
             
-            # When chunk is full or last line
-            if [ $count -eq 200 ] || [ ! -s <(tail -n+$((count+1)) ec2_ranges.txt) ]; then
+            # When chunk is full or at EOF
+            if [ $count -eq 200 ] || [ ! -s <(tail -n+$((count+1)) ec2_ranges.txt 2>/dev/null) ]; then
               # Convert current chunk to JSON
               chunk_json=$(printf '%s\n' "${current_chunk[@]}" | jq -R . | jq -s .)
               chunks+=("$chunk_json")
@@ -58,11 +58,12 @@ jobs:
           # Create final JSON output
           chunks_json=$(printf '%s\n' "${chunks[@]}" | jq -s .)
           
+          # Use proper multiline output syntax for GitHub Actions
           {
-            echo "chunks<<EOF"
+            echo 'chunks<<EOF'
             echo "$chunks_json"
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
           
           total_chunks=$(echo "$chunks_json" | jq length)
           echo "Created $total_chunks chunks of ranges"
