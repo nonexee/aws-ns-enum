@@ -1,55 +1,70 @@
-name: Scan EC2 TLS
+name: EC2 TLS Scan
 
 on:
   workflow_dispatch:
 
 jobs:
-  scan:
+  prepare:
     runs-on: ubuntu-latest
-
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-        with:
-          persist-credentials: true
-
-      - name: Adjust workspace permissions
-        run: chmod -R 777 "${{ github.workspace }}"
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y curl jq
 
       - name: Download EC2 IP ranges
         run: |
-          curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | \
-            jq -r '.prefixes[] | select(.service=="EC2") | .ip_prefix' > ec2_ranges.txt
+          curl -s https://ip-ranges.amazonaws.com/ip-ranges.json \
+            | jq -r '.prefixes[] | select(.service=="EC2") | .ip_prefix' > ec2_ranges.txt
           echo "Found EC2 ranges:"
           cat ec2_ranges.txt
 
-      - name: Scan each EC2 range with ZMap
+      - name: Create dynamic matrix JSON
+        id: set-matrix
         run: |
-          mkdir -p open_ips
-          while read range; do
-            echo "Scanning range: $range"
-            # Create a file name based on the CIDR (replace '/' and '.' with underscores)
-            fname=$(echo "$range" | tr '/.' '__')
-            docker run --rm --network=host -v "${{ github.workspace }}":/data sec32/zmap zmap -M tcp_synscan -p 443 -B 100K "$range" -o /data/open_ips/open_ips_${fname}.csv
-          done < ec2_ranges.txt
+          # Read the file and produce a JSON array of ranges
+          matrix=$(jq -R -s -c 'split("\n") | map(select(length > 0))' ec2_ranges.txt)
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
 
-      - name: Combine open IP results
+  scan:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cidr: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Create folder for range ${{ matrix.cidr }}
         run: |
-          cat open_ips/*.csv > open_ips_all.csv
-          echo "Total responsive IPs found: $(wc -l < open_ips_all.csv)"
-          head -n 5 open_ips_all.csv
+          # Replace '/' and '.' with safe characters for folder naming
+          folder=$(echo "${{ matrix.cidr }}" | tr '/.' '__')
+          mkdir -p open_ips/$folder certs/$folder
 
-      - name: Run ZGrab2 to grab TLS certs
+      - name: Scan ${{ matrix.cidr }} with ZMap
         run: |
-          docker run --rm --network=host -v "${{ github.workspace }}":/data -i sec32/zgrab2 zgrab2 tls --port 443 --input-file=/data/open_ips_all.csv --output-file=/data/certs.json
+          folder=$(echo "${{ matrix.cidr }}" | tr '/.' '__')
+          echo "Scanning range: ${{ matrix.cidr }}"
+          docker run --rm --network=host -v "${{ github.workspace }}":/data sec32/zmap \
+            zmap -M tcp_synscan -p 443 -B 100K "${{ matrix.cidr }}" \
+            -o /data/open_ips/${folder}/open_ips.csv
 
-      - name: Upload final certs.json artifact
+      - name: Grab TLS certs with ZGrab2 for ${{ matrix.cidr }}
+        run: |
+          folder=$(echo "${{ matrix.cidr }}" | tr '/.' '__')
+          docker run --rm --network=host -v "${{ github.workspace }}":/data -i sec32/zgrab2 \
+            zgrab2 tls --port 443 \
+            --input-file=/data/open_ips/${folder}/open_ips.csv \
+            --output-file=/data/certs/${folder}/certs.json
+
+      - name: Upload artifact for ${{ matrix.cidr }}
         uses: actions/upload-artifact@v4
         with:
-          name: certs-json
-          path: certs.json
+          name: certs-${{ matrix.cidr | replace("/", "-") | replace(".", "_") }}
+          path: certs/${{ matrix.cidr | replace("/", "-") | replace(".", "_") }}/certs.json
