@@ -1,0 +1,13 @@
+{
+  "scan_time": "2025-02-21T12:37:56Z",
+  "ranges_processed": 1,
+  "total_ips_found": 545,
+  "ranges": [
+    {
+      "range": "5.22.160.0/19",
+      "total_ips": 545,
+      "scan_time": "2025-02-21T12:37:56Z",
+      "error": null
+    }
+  ]
+}
