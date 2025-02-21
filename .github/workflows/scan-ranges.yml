@@ -35,7 +35,7 @@ jobs:
           
           echo "Processing lines $START_LINE to $END_LINE"
           
-          # Extract ranges using awk instead of sed
+          # Extract ranges using awk
           readarray -t RANGES < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
           
           echo "Found ${#RANGES[@]} ranges to process"
@@ -49,41 +49,47 @@ jobs:
             # Create safe filename
             safe_name=$(echo "$cidr" | tr '/' '_')
             
+            # Create temporary directory for this range
+            tmp_dir=$(mktemp -d)
+            
             # Run ZMap scan
             echo "Running ZMap scan..."
             docker run --rm --network=host -v "${{ github.workspace }}":/data \
               sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
-              "$cidr" -o /data/open_ips.csv
+              "$cidr" -o "/data/tmp_open_ips.csv"
             
             # Check if we found any open ports
-            if [ -s open_ips.csv ]; then
+            if [ -s tmp_open_ips.csv ]; then
               echo "Found open ports, running ZGrab2..."
               docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
                 sec32/zgrab2 zgrab2 tls --port 443 \
-                --input-file=/data/open_ips.csv \
-                --output-file=/data/certs.json
+                --input-file=/data/tmp_open_ips.csv \
+                --output-file=/data/tmp_certs.json
               
-              # Compress results
-              echo "Compressing results..."
-              tar czf "scan_results/${safe_name}.tar.gz" certs.json
-              
-              # Cleanup
-              rm -f certs.json open_ips.csv
-              
-              echo "Completed range: $cidr"
+              # Move results to temp dir
+              mv tmp_certs.json "$tmp_dir/certs.json"
             else
               echo "No open ports found for range: $cidr"
-              echo '{"results":[]}' | tar czf "scan_results/${safe_name}.tar.gz" -
+              # Create empty results file
+              echo '{"results":[],"range":"'$cidr'","scan_time":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"}' > "$tmp_dir/certs.json"
             fi
+            
+            # Create tar archive from temp directory
+            tar -czf "scan_results/${safe_name}.tar.gz" -C "$tmp_dir" .
+            
+            # Cleanup
+            rm -f tmp_open_ips.csv
+            rm -rf "$tmp_dir"
+            
+            echo "Completed range: $cidr"
           done
           
-          # Commit results if any were generated
-          if [ -n "$(ls -A scan_results/)" ]; then
-            git config --local user.email "action@github.com"
-            git config --local user.name "GitHub Action"
-            git add scan_results/
-            git commit -m "Add scan results for ranges $START_LINE-$END_LINE"
+          # Commit results
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add scan_results/
+          git commit -m "Add scan results for ranges $START_LINE-$END_LINE"
+          git push || {
+            git pull --rebase
             git push
-          else
-            echo "No results were generated"
-          fi
+          }
