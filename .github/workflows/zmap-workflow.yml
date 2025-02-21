@@ -1,0 +1,148 @@
+name: ZMap Port 443 Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_line:
+        description: 'Start processing from line number (1-based)'
+        required: true
+        type: number
+      batch_size:
+        description: 'Number of ranges to process'
+        required: true
+        type: number
+        default: 1
+
+jobs:
+  zmap-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+
+      - name: Setup workspace
+        run: |
+          mkdir -p zmap_results
+          chmod -R 777 "${{ github.workspace }}"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq parallel
+
+      - name: Process ranges with ZMap
+        run: |
+          # Function to process ZMap results
+          process_zmap_results() {
+            local input_file=$1
+            local cidr=$2
+            local output_file=$3
+            
+            # Convert to JSON format with metadata
+            jq -Rn --arg cidr "$cidr" --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" '
+              reduce inputs as $line ({ips: [], count: 0};
+                if ($line | length) > 0 then
+                  .ips += [$line] | .count += 1
+                else
+                  .
+                end
+              ) | {
+                range: $cidr,
+                scan_time: $time,
+                total_ips: .count,
+                ips: .ips
+              }' < "$input_file" > "$output_file"
+          }
+
+          # Process each range
+          START_LINE=${{ inputs.start_line }}
+          END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
+          
+          readarray -t RANGES < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
+          
+          for cidr in "${RANGES[@]}"; do
+            [ -z "$cidr" ] && continue
+            
+            echo "Processing range: $cidr"
+            safe_name=$(echo "$cidr" | tr '/' '_')
+            result_file="zmap_results/${safe_name}.json"
+            
+            echo "Running ZMap scan for $cidr"
+            if timeout 30m docker run --rm --network=host -v "${{ github.workspace }}":/data \
+              sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
+              --cooldown-time=2 \
+              "$cidr" -o "/data/tmp_open_ips.csv"; then
+              
+              if [ -s tmp_open_ips.csv ]; then
+                echo "Found open ports, processing results..."
+                process_zmap_results "tmp_open_ips.csv" "$cidr" "$result_file"
+                
+                # Create summary file
+                total_ips=$(jq '.total_ips' "$result_file")
+                echo "Scan completed successfully for $cidr - Found $total_ips active hosts"
+                
+              else
+                echo "No open ports found for range: $cidr"
+                # Create empty result file
+                echo "{
+                  \"range\": \"$cidr\",
+                  \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+                  \"total_ips\": 0,
+                  \"ips\": []
+                }" > "$result_file"
+              fi
+            else
+              echo "ZMap scan failed for range: $cidr"
+              # Create error result file
+              echo "{
+                \"range\": \"$cidr\",
+                \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+                \"error\": \"scan_timeout\",
+                \"total_ips\": 0,
+                \"ips\": []
+              }" > "$result_file"
+            fi
+            
+            # Cleanup temporary files
+            rm -f tmp_open_ips.csv
+          done
+          
+          # Create summary file
+          echo "Creating summary file..."
+          jq -s '{
+            scan_time: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
+            ranges_processed: length,
+            total_ips_found: (map(.total_ips) | add),
+            ranges: map({
+              range: .range,
+              total_ips: .total_ips,
+              scan_time: .scan_time,
+              error: .error?
+            })
+          }' zmap_results/*.json > zmap_results/summary.json
+          
+          # Commit results with retry logic
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if git add zmap_results/ && \
+               git commit -m "Add ZMap scan results for ranges $START_LINE-$END_LINE" && \
+               git push; then
+              break
+            else
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "Push failed, retrying... (Attempt $RETRY_COUNT of $MAX_RETRIES)"
+                git pull --rebase
+              else
+                echo "Failed to push after $MAX_RETRIES attempts"
+                exit 1
+              fi
+            fi
+          done
