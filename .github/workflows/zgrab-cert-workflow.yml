@@ -52,97 +52,81 @@ jobs:
             local temp_file="temp_processed.json"
             : > "$temp_file"
             
+            # Process each line and clean nulls
             while IFS= read -r line; do
               if [ -n "$line" ]; then
                 echo "$line" | jq -c '
-                  select(.data != null and .data.tls != null) | {
-                    ip: .ip,
-                    tls: {
-                      protocol_version: (.data.tls.result.handshake_log.server_hello.version.name),
-                      cipher_suite: {
-                        name: (.data.tls.result.handshake_log.server_hello.cipher_suite.name),
-                        value: (.data.tls.result.handshake_log.server_hello.cipher_suite.value)
-                      },
-                      certificate_details: {
-                        validity: {
-                          start: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start),
-                          end: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end)
-                        },
+                  select(.data != null and .data.tls != null) | 
+                  {
+                    ip,
+                    tls: (.data.tls | {
+                      protocol_version: .result.handshake_log.server_hello.version.name,
+                      cipher_suite: (.result.handshake_log.server_hello.cipher_suite | {
+                        name: .name,
+                        value: .value
+                      }),
+                      certificate_details: (.result.handshake_log.server_certificates.certificate.parsed | {
+                        validity: (.validity | {
+                          start,
+                          end
+                        }),
                         issuer: {
-                          common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0]),
-                          organization: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.organization[0]),
-                          country: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.country[0])
+                          common_name: .issuer.common_name[0],
+                          organization: .issuer.organization[0],
+                          country: .issuer.country[0]
                         },
                         subject: {
-                          common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0])
+                          common_name: .subject.common_name[0]
                         },
-                        public_key: {
-                          algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name),
-                          length: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length)
-                        },
-                        extensions: {
-                          basic_constraints: {
-                            is_ca: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.basic_constraints.is_ca)
-                          },
-                          key_usage: {
-                            digital_signature: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.digital_signature),
-                            key_encipherment: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.key_encipherment)
-                          },
-                          subject_alt_name: {
-                            dns_names: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.subject_alt_name.dns_names)
-                          }
-                        },
-                        security_features: {
-                          ocsp_stapling: (.data.tls.result.handshake_log.server_hello.ocsp_stapling),
-                          secure_renegotiation: (.data.tls.result.handshake_log.server_hello.secure_renegotiation),
-                          extended_master_secret: (.data.tls.result.handshake_log.server_hello.extended_master_secret)
-                        },
-                        signature: {
-                          algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.signature_algorithm.name),
-                          valid: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.valid)
-                        }
-                      },
+                        public_key: (.subject_key_info | {
+                          algorithm: .key_algorithm.name,
+                          length: .rsa_public_key.length
+                        }),
+                        extensions: (.extensions | {
+                          basic_constraints: { is_ca },
+                          key_usage: { digital_signature, key_encipherment },
+                          subject_alt_name: { dns_names }
+                        }),
+                        security_features: (.result.handshake_log.server_hello | {
+                          ocsp_stapling,
+                          secure_renegotiation,
+                          extended_master_secret
+                        }),
+                        signature: (.signature | {
+                          algorithm: .signature_algorithm.name,
+                          valid
+                        })
+                      }),
                       security_audit: {
                         certificate_chain: [
-                          .data.tls.result.handshake_log.server_certificates.chain[]? | 
+                          .result.handshake_log.server_certificates.chain[]? | 
                           select(. != null) | {
-                            issuer_common_name: (.parsed.issuer.common_name[0]),
-                            valid: (.parsed.signature.valid)
+                            issuer_common_name: .parsed.issuer.common_name[0],
+                            valid: .parsed.signature.valid
                           }
                         ],
-                        browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted)
+                        browser_trusted: .result.handshake_log.server_certificates.validation.browser_trusted
                       }
-                    }
-                  } | walk(
-                    if type == "object" then
-                      with_entries(select(.value != null and .value != [] and .value != {}))
-                    elif type == "array" then
-                      select(length > 0)
-                    else
-                      .
-                    end
-                  )' >> "$temp_file" || true
+                    })
+                  } | del(..|nulls)' >> "$temp_file" || true
               fi
             done < "$input_file"
             
             if [ -s "$temp_file" ]; then
-              # Remove entries where all fields are null or empty
+              # Filter out empty objects and arrays
               jq -s '
-                map(select(. != {} and (. | walk(
-                  if type == "object" then
-                    with_entries(select(.value != null and .value != [] and .value != {}))
-                  elif type == "array" then
-                    select(length > 0)
-                  else
-                    .
-                  end
-                )) | length > 0)) | {
+                map(select(. != null) | with_entries(
+                  select(
+                    .value != null and 
+                    .value != [] and 
+                    (.value | type == "object" | not or . != {})
+                  )
+                )) |
+                {
                   certificates: .,
                   total_count: length,
                   scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-                }
-              ' "$temp_file" > "$output_file"
-              rm -f "$temp_file"
+                }' "$temp_file" > "$output_file"
             else
               echo '{
                 "certificates": [],
@@ -150,9 +134,11 @@ jobs:
                 "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
               }' > "$output_file"
             fi
+            
+            rm -f "$temp_file"
           }
 
-          # Rest of the script remains the same...
+          # Process each range
           START_LINE=${{ inputs.start_line }}
           END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
           
