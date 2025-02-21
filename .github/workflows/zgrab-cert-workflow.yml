@@ -55,88 +55,77 @@ jobs:
             while IFS= read -r line; do
               if [ -n "$line" ]; then
                 echo "$line" | jq -c '
-                  select(.data != null and .data.tls != null) | 
-                  select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name != null) |
-                  {
-                    ip,
-                    tls: (.data.tls | {
-                      protocol_version: .result.handshake_log.server_hello.version.name,
-                      cipher_suite: (
-                        select(.result.handshake_log.server_hello.cipher_suite != null) |
-                        .result.handshake_log.server_hello.cipher_suite | {
-                          name,
-                          value
+                  select(.data != null and .data.tls != null) |
+                  select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != null) |
+                  select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != "") | {
+                    ip: .ip,
+                    tls: {
+                      protocol_version: (.data.tls.result.handshake_log.server_hello.version.name // null),
+                      cipher_suite: {
+                        name: (.data.tls.result.handshake_log.server_hello.cipher_suite.name // null),
+                        value: (.data.tls.result.handshake_log.server_hello.cipher_suite.value // null)
+                      },
+                      certificate_details: {
+                        validity: {
+                          start: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start // null),
+                          end: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end // null)
+                        },
+                        issuer: {
+                          common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0] // null),
+                          organization: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.organization[0] // null),
+                          country: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.country[0] // null)
+                        },
+                        subject: {
+                          common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] // null)
+                        },
+                        public_key: {
+                          algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name // null),
+                          length: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length // null)
+                        },
+                        extensions: {
+                          basic_constraints: {
+                            is_ca: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.basic_constraints.is_ca // false)
+                          },
+                          key_usage: {
+                            digital_signature: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.digital_signature // false),
+                            key_encipherment: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.key_encipherment // false)
+                          },
+                          subject_alt_name: {
+                            dns_names: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.subject_alt_name.dns_names // [])
+                          }
+                        },
+                        security_features: {
+                          ocsp_stapling: (.data.tls.result.handshake_log.server_hello.ocsp_stapling // false),
+                          secure_renegotiation: (.data.tls.result.handshake_log.server_hello.secure_renegotiation // false),
+                          extended_master_secret: (.data.tls.result.handshake_log.server_hello.extended_master_secret // false)
+                        },
+                        signature: {
+                          algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.signature_algorithm.name // null),
+                          valid: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.valid // false)
                         }
-                      ),
-                      certificate_details: (.result.handshake_log.server_certificates.certificate.parsed | {
-                        validity: (select(.validity != null) | .validity | {
-                          start,
-                          end
-                        }),
-                        issuer: (select(.issuer != null) | .issuer | {
-                          common_name: .common_name[0],
-                          organization: .organization[0],
-                          country: .country[0]
-                        }),
-                        subject: (select(.subject != null) | .subject | {
-                          common_name: .common_name[0]
-                        }),
-                        public_key: (select(.subject_key_info != null) | .subject_key_info | {
-                          algorithm: .key_algorithm.name,
-                          length: .rsa_public_key.length
-                        }),
-                        extensions: (select(.extensions != null) | .extensions | {
-                          basic_constraints: (select(.basic_constraints != null) | .basic_constraints | {
-                            is_ca
-                          }),
-                          key_usage: (select(.key_usage != null) | .key_usage | {
-                            digital_signature,
-                            key_encipherment
-                          }),
-                          subject_alt_name: (select(.subject_alt_name != null) | .subject_alt_name | {
-                            dns_names
-                          })
-                        } | select(.[] != {})),
-                        security_features: (.result.handshake_log.server_hello | select(. != null) | {
-                          ocsp_stapling,
-                          secure_renegotiation,
-                          extended_master_secret
-                        } | select(. != {})),
-                        signature: (select(.signature != null) | .signature | {
-                          algorithm: .signature_algorithm.name,
-                          valid
-                        })
-                      } | select(. != {})),
+                      },
                       security_audit: {
                         certificate_chain: [
-                          .result.handshake_log.server_certificates.chain[]? | 
-                          select(. != null and .parsed != null) | {
-                            issuer_common_name: .parsed.issuer.common_name[0],
-                            valid: .parsed.signature.valid
+                          .data.tls.result.handshake_log.server_certificates.chain[]? | 
+                          select(. != null) | {
+                            issuer_common_name: (.parsed.issuer.common_name[0] // null),
+                            valid: (.parsed.signature.valid // false)
                           }
                         ],
-                        browser_trusted: .result.handshake_log.server_certificates.validation.browser_trusted
+                        browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted // false)
                       }
-                    })
-                  } | select(.tls.certificate_details != null)' >> "$temp_file" || true
+                    }
+                  }' >> "$temp_file" || true
               fi
             done < "$input_file"
             
             if [ -s "$temp_file" ]; then
-              # Remove empty objects and do final cleanup
-              jq -s '
-                map(
-                  select(
-                    .tls.certificate_details != null and
-                    .tls.certificate_details.subject != null and
-                    .tls.certificate_details.subject.common_name != null
-                  )
-                ) |
-                {
-                  certificates: .,
-                  total_count: length,
-                  scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-                }' "$temp_file" > "$output_file"
+              jq -s '{
+                certificates: .,
+                total_count: length,
+                scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
+              }' "$temp_file" > "$output_file"
+              rm -f "$temp_file"
             else
               echo '{
                 "certificates": [],
@@ -144,11 +133,9 @@ jobs:
                 "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
               }' > "$output_file"
             fi
-            
-            rm -f "$temp_file"
           }
 
-          # Rest of script remains the same...
+          # Rest of the script remains the same...
           START_LINE=${{ inputs.start_line }}
           END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
           
@@ -158,7 +145,6 @@ jobs:
             echo "Processing range: $cidr"
             safe_name=$(echo "$cidr" | tr '/' '_')
             
-            # Check if ZMap results exist
             zmap_result="zmap_results/${safe_name}.json"
             if [ ! -f "$zmap_result" ]; then
               echo "No ZMap results found for $cidr, skipping..."
