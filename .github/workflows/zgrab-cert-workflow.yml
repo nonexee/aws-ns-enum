@@ -34,28 +34,33 @@ jobs:
 
       - name: Process ranges with ZGrab2
         run: |
-          # Helper function to clean JSON output
-          clean_json_output() {
-            local infile="$1"
-            local outfile="$2"
-            jq -c '{
-              results: [.[] | select(.data.tls != null) | {
+          # Helper function to process ZGrab output
+          process_zgrab_output() {
+            local input_file="$1"
+            local output_file="$2"
+            jq -c '
+              select(.data.tls != null) | {
                 ip: .ip,
-                data: {
-                  tls: {
-                    status: .data.tls.status,
-                    protocol: .data.tls.protocol,
-                    result: {
-                      handshake_log: {
-                        server_hello: .data.tls.result.handshake_log.server_hello,
-                        server_certificates: .data.tls.result.handshake_log.server_certificates
-                      }
-                    }
+                timestamp: now,
+                tls: {
+                  version: .data.tls.result.handshake_log.server_hello.version.name,
+                  cipher_suite: .data.tls.result.handshake_log.server_hello.cipher_suite.name,
+                  certificate: {
+                    subject: .data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0],
+                    issuer: .data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0],
+                    validity: {
+                      start: .data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start,
+                      end: .data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end
+                    },
+                    fingerprint_sha256: .data.tls.result.handshake_log.server_certificates.certificate.parsed.fingerprint_sha256
                   }
                 }
-              }],
-              scan_time: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
-            }' "$infile" > "$outfile"
+              }
+            ' "$input_file" | jq -s '{
+              certificates: .,
+              total_count: length,
+              scan_time: now | strftime("%Y-%m-%dT%H:%M:%SZ")
+            }' > "$output_file"
           }
 
           # Process each range
@@ -94,70 +99,56 @@ jobs:
                 --output-file=/data/tmp_certs.json; then
                 
                 echo "Processing ZGrab2 results..."
+                process_zgrab_output "tmp_certs.json" "cert_results/${safe_name}/processed_certs.json"
                 
-                # Clean and transform the results
-                clean_json_output "tmp_certs.json" "cert_results/${safe_name}/results.json"
-                
-                # Create a manifest file
-                total_results=$(jq '.results | length' "cert_results/${safe_name}/results.json")
+                # Create summary for this range
+                total_certs=$(jq '.total_count' "cert_results/${safe_name}/processed_certs.json")
                 echo "{
                   \"range\": \"$cidr\",
-                  \"total_results\": $total_results,
+                  \"total_certificates\": $total_certs,
                   \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
-                }" > "cert_results/${safe_name}/manifest.json"
+                }" > "cert_results/${safe_name}/summary.json"
                 
-                echo "Processed $total_results certificates for $cidr"
+                echo "Found $total_certs certificates for $cidr"
               else
                 echo "ZGrab2 scan failed for range: $cidr"
                 echo "{
                   \"range\": \"$cidr\",
                   \"error\": \"zgrab2_scan_failed\",
                   \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
-                }" > "cert_results/${safe_name}/manifest.json"
+                }" > "cert_results/${safe_name}/summary.json"
               fi
             else
               echo "No IPs found in ZMap results for range: $cidr"
               echo "{
                 \"range\": \"$cidr\",
-                \"total_results\": 0,
+                \"total_certificates\": 0,
                 \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
-              }" > "cert_results/${safe_name}/manifest.json"
+              }" > "cert_results/${safe_name}/summary.json"
             fi
             
             # Cleanup temporary files
             rm -f tmp_ips.txt tmp_certs.json
           done
           
-          # Create summary file
-          echo "Creating summary file..."
-          find cert_results -name manifest.json -exec cat {} \; | \
+          # Create global summary
+          echo "Creating global summary..."
+          find cert_results -name summary.json -exec cat {} \; | \
             jq -s '{
               scan_time: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
               ranges_processed: length,
-              total_results: (map(.total_results // 0) | add),
-              ranges: map({
-                range: .range,
-                total_results: (.total_results // 0),
-                error: .error?,
-                scan_time: .scan_time
-              })
-            }' > cert_results/summary.json
+              total_certificates: (map(.total_certificates // 0) | add),
+              ranges: .
+            }' > cert_results/global_summary.json
           
           # Commit results
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          if git add cert_results/ && \
-             git commit -m "Add certificate scan results for ranges $START_LINE-$END_LINE" && \
-             git push; then
-            echo "Successfully committed and pushed results"
-          else
-            echo "Failed to commit results, trying with rebase..."
-            git pull --rebase
-            if git push; then
-              echo "Successfully pushed results after rebase"
-            else
-              echo "Failed to push results even after rebase"
-              exit 1
-            fi
+          git add cert_results/
+          if git commit -m "Add certificate scan results for ranges $START_LINE-$END_LINE"; then
+            git push || {
+              git pull --rebase
+              git push
+            }
           fi
