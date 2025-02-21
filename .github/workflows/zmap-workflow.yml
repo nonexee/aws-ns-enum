@@ -78,7 +78,7 @@ jobs:
             result_file="zmap_results/${safe_name}.json"
             
             echo "Running ZMap scan for $cidr"
-            if timeout 30m docker run --rm --network=host -v "${{ github.workspace }}":/data \
+            if timeout 360m docker run --rm --network=host -v "${{ github.workspace }}":/data \
               sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
               --cooldown-time=2 \
               "$cidr" -o "/data/tmp_open_ips.csv"; then
