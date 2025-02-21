@@ -41,18 +41,59 @@ jobs:
             jq -c '
               select(.data.tls != null) | {
                 ip: .ip,
-                timestamp: now,
                 tls: {
-                  version: .data.tls.result.handshake_log.server_hello.version.name,
-                  cipher_suite: .data.tls.result.handshake_log.server_hello.cipher_suite.name,
-                  certificate: {
-                    subject: .data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0],
-                    issuer: .data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0],
+                  protocol_version: .data.tls.result.handshake_log.server_hello.version.name,
+                  cipher_suite: {
+                    name: .data.tls.result.handshake_log.server_hello.cipher_suite.name,
+                    value: .data.tls.result.handshake_log.server_hello.cipher_suite.value
+                  },
+                  certificate_details: {
                     validity: {
                       start: .data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start,
                       end: .data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end
                     },
-                    fingerprint_sha256: .data.tls.result.handshake_log.server_certificates.certificate.parsed.fingerprint_sha256
+                    issuer: {
+                      common_name: .data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0],
+                      organization: .data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.organization[0],
+                      country: .data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.country[0]
+                    },
+                    subject: {
+                      common_name: .data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0]
+                    },
+                    public_key: {
+                      algorithm: .data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name,
+                      length: .data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length
+                    },
+                    extensions: {
+                      basic_constraints: {
+                        is_ca: .data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.basic_constraints.is_ca
+                      },
+                      key_usage: {
+                        digital_signature: .data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.digital_signature,
+                        key_encipherment: .data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.key_encipherment
+                      },
+                      subject_alt_name: {
+                        dns_names: .data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.subject_alt_name.dns_names
+                      }
+                    },
+                    security_features: {
+                      ocsp_stapling: .data.tls.result.handshake_log.server_hello.ocsp_stapling,
+                      secure_renegotiation: .data.tls.result.handshake_log.server_hello.secure_renegotiation,
+                      extended_master_secret: .data.tls.result.handshake_log.server_hello.extended_master_secret
+                    },
+                    signature: {
+                      algorithm: .data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.signature_algorithm.name,
+                      valid: .data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.valid
+                    }
+                  },
+                  security_audit: {
+                    certificate_chain: [
+                      .data.tls.result.handshake_log.server_certificates.chain[] | {
+                        issuer_common_name: .parsed.issuer.common_name[0],
+                        valid: (if .parsed.signature.valid == null then true else .parsed.signature.valid end)
+                      }
+                    ],
+                    browser_trusted: .data.tls.result.handshake_log.server_certificates.validation.browser_trusted
                   }
                 }
               }
@@ -99,17 +140,20 @@ jobs:
                 --output-file=/data/tmp_certs.json; then
                 
                 echo "Processing ZGrab2 results..."
-                process_zgrab_output "tmp_certs.json" "cert_results/${safe_name}/processed_certs.json"
+                process_zgrab_output "tmp_certs.json" "cert_results/${safe_name}/certs.json"
                 
                 # Create summary for this range
-                total_certs=$(jq '.total_count' "cert_results/${safe_name}/processed_certs.json")
+                total_certs=$(jq '.total_count' "cert_results/${safe_name}/certs.json")
+                browser_trusted=$(jq '[.certificates[].tls.security_audit.browser_trusted] | map(select(. == true)) | length' "cert_results/${safe_name}/certs.json")
+                
                 echo "{
                   \"range\": \"$cidr\",
                   \"total_certificates\": $total_certs,
+                  \"browser_trusted_certificates\": $browser_trusted,
                   \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
                 }" > "cert_results/${safe_name}/summary.json"
                 
-                echo "Found $total_certs certificates for $cidr"
+                echo "Found $total_certs certificates ($browser_trusted browser-trusted) for $cidr"
               else
                 echo "ZGrab2 scan failed for range: $cidr"
                 echo "{
@@ -123,6 +167,7 @@ jobs:
               echo "{
                 \"range\": \"$cidr\",
                 \"total_certificates\": 0,
+                \"browser_trusted_certificates\": 0,
                 \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
               }" > "cert_results/${safe_name}/summary.json"
             fi
@@ -138,6 +183,7 @@ jobs:
               scan_time: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
               ranges_processed: length,
               total_certificates: (map(.total_certificates // 0) | add),
+              browser_trusted_certificates: (map(.browser_trusted_certificates // 0) | add),
               ranges: .
             }' > cert_results/global_summary.json
           
