@@ -45,7 +45,7 @@ jobs:
             if [ -f "$dir/certs.json" ]; then
               echo "Skipping $dir - already processed"
               continue
-            }
+            fi
             
             # Verify cidr.txt exists
             if [ ! -f "$dir/cidr.txt" ]; then
