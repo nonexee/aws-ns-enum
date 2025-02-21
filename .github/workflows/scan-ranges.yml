@@ -22,33 +22,59 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
+          # Debug: List all directories
+          echo "Available directories:"
+          ls -la ranges/
+          
+          # Ensure ranges directory exists
+          if [ ! -d "ranges" ]; then
+            echo "ranges directory not found"
+            exit 1
+          fi
+
           # Process each range directory
-          for dir in ranges/*/; do
-            # Skip if directory doesn't exist
-            [ ! -d "$dir" ] && continue
+          find ranges -type d -mindepth 1 -maxdepth 1 | while read -r dir; do
+            # Debug: Show current directory being processed
+            echo "Processing directory: $dir"
+            
+            # Show contents of directory
+            echo "Directory contents:"
+            ls -la "$dir"
             
             # Skip if certs.json already exists
-            [ -f "$dir/certs.json" ] && {
+            if [ -f "$dir/certs.json" ]; then
               echo "Skipping $dir - already processed"
               continue
             }
+            
+            # Verify cidr.txt exists
+            if [ ! -f "$dir/cidr.txt" ]; then
+              echo "Error: cidr.txt not found in $dir"
+              continue
+            fi
             
             # Read CIDR range
             cidr=$(cat "$dir/cidr.txt")
             echo "Processing range: $cidr"
             
+            # Create temporary directory for this range
+            tmp_dir="$dir/tmp"
+            mkdir -p "$tmp_dir"
+            
             # Run ZMap scan
+            echo "Starting ZMap scan for $cidr"
             docker run --rm --network=host -v "${{ github.workspace }}":/data \
               sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
-              "$cidr" -o /data/temp_open_ips.csv
+              "$cidr" -o "/data/$dir/tmp/open_ips.csv"
             
             # Check if ZMap found any IPs
-            if [ -s "${{ github.workspace }}/temp_open_ips.csv" ]; then
+            if [ -s "$tmp_dir/open_ips.csv" ]; then
+              echo "ZMap found open ports, running ZGrab2"
               # Run ZGrab2
               docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
                 sec32/zgrab2 zgrab2 tls --port 443 \
-                --input-file=/data/temp_open_ips.csv \
-                --output-file="$dir/certs.json"
+                --input-file="/data/$dir/tmp/open_ips.csv" \
+                --output-file="/data/$dir/certs.json"
               
               echo "Completed scanning range: $cidr"
             else
@@ -57,11 +83,15 @@ jobs:
               echo '{"results":[]}' > "$dir/certs.json"
             fi
             
+            # Cleanup temporary files
+            rm -rf "$tmp_dir"
+            
             # Commit results
             git add "$dir/certs.json"
             git commit -m "Add scan results for range $cidr"
-            git push
-            
-            # Cleanup
-            rm -f "${{ github.workspace }}/temp_open_ips.csv"
+            git push || {
+              echo "Failed to push changes, trying to pull and push again"
+              git pull --rebase
+              git push
+            }
           done
