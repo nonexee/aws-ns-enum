@@ -36,12 +36,12 @@ jobs:
       - name: Process ranges with ZGrab2
         run: |
           process_zgrab_output() {
-            local input_file="$1"
+            local cert_dir="${1%/*}"       # Extract directory path
+            local cert_file="${1##*/}"     # Extract filename
             local base_dir="$2"
-            local safe_name="$3"
             
-            if [ ! -s "$input_file" ]; then
-              echo "Empty or missing input file: $input_file"
+            if [ ! -s "$1" ]; then
+              echo "Empty or missing input file: $1"
               echo '{
                 "certificates": [],
                 "total_count": 0,
@@ -51,9 +51,9 @@ jobs:
             fi
             
             echo "Processing certificates..."
-            local temp_file="${base_dir}/temp_certs.json"
+            local temp_json="${base_dir}/temp_certs.json"
             
-            # Process and create initial JSON
+            # Process the ZGrab2 output into structured JSON
             jq -c '
               select(.data != null and .data.tls != null) |
               select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != null) |
@@ -81,27 +81,6 @@ jobs:
                     public_key: {
                       algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name // null),
                       length: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length // null)
-                    },
-                    extensions: {
-                      basic_constraints: {
-                        is_ca: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.basic_constraints.is_ca // false)
-                      },
-                      key_usage: {
-                        digital_signature: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.digital_signature // false),
-                        key_encipherment: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.key_encipherment // false)
-                      },
-                      subject_alt_name: {
-                        dns_names: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.subject_alt_name.dns_names // [])
-                      }
-                    },
-                    security_features: {
-                      ocsp_stapling: (.data.tls.result.handshake_log.server_hello.ocsp_stapling // false),
-                      secure_renegotiation: (.data.tls.result.handshake_log.server_hello.secure_renegotiation // false),
-                      extended_master_secret: (.data.tls.result.handshake_log.server_hello.extended_master_secret // false)
-                    },
-                    signature: {
-                      algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.signature_algorithm.name // null),
-                      valid: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.valid // false)
                     }
                   },
                   security_audit: {
@@ -115,34 +94,34 @@ jobs:
                     browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted // false)
                   }
                 }
-              }' "$input_file" | jq -s '{
+              }' "$1" | jq -s '{
                 certificates: .,
                 total_count: length,
                 scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-              }' > "$temp_file"
+              }' > "$temp_json"
 
-            # Check file size and compress if needed
-            local file_size=$(stat -f%z "$temp_file" 2>/dev/null || stat -c%s "$temp_file")
+            # Check file size
+            local file_size=$(stat -f%z "$temp_json" 2>/dev/null || stat -c%s "$temp_json")
             local size_mb=$((file_size / 1024 / 1024))
             
+            echo "Results file is ${size_mb}MB"
             if [ $size_mb -gt 30 ]; then
-              echo "Results file is ${size_mb}MB, compressing..."
-              # Create compressed version
-              gzip -9 -c "$temp_file" > "${base_dir}/certs.json.gz"
-              # Create small metadata file
-              jq '{
-                total_count: .total_count,
-                scan_time: .scan_time,
-                compressed: true,
-                original_size_mb: '$size_mb'
-              }' "$temp_file" > "${base_dir}/certs.json"
-              rm "$temp_file"
+                echo "Compressing large results file..."
+                # Compress the full data
+                gzip -9c "$temp_json" > "${base_dir}/certs.json.gz"
+                # Create metadata file
+                jq '{
+                    total_count: .total_count,
+                    scan_time: .scan_time,
+                    compressed: true,
+                    original_size_mb: '$size_mb'
+                }' "$temp_json" > "${base_dir}/certs.json"
+                rm -f "$temp_json"
             else
-              mv "$temp_file" "${base_dir}/certs.json"
+                mv "$temp_json" "${base_dir}/certs.json"
             fi
           }
 
-          # Process each range
           START_LINE=${{ inputs.start_line }}
           END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
           
@@ -173,25 +152,24 @@ jobs:
                 --input-file=/data/tmp_ips.txt \
                 --output-file=/data/tmp_certs.json; then
                 
-                process_zgrab_output "tmp_certs.json" "$results_dir" "$safe_name"
+                process_zgrab_output "tmp_certs.json" "$results_dir"
                 
-                # Get results and create summary
-                local total_certs=$(jq '.total_count' "${results_dir}/certs.json")
-                local is_compressed=$(jq -r '.compressed // false' "${results_dir}/certs.json")
-                
-                if [ "$is_compressed" = "true" ]; then
-                  echo "Created compressed certificate data for $cidr with $total_certs certificates"
+                if [ -f "${results_dir}/certs.json" ]; then
+                  total_certs=$(jq '.total_count' "${results_dir}/certs.json")
+                  is_compressed=$(jq -r '.compressed // false' "${results_dir}/certs.json")
+                  
+                  # Create summary file
+                  echo "{
+                    \"range\": \"$cidr\",
+                    \"total_certificates\": $total_certs,
+                    \"compressed\": $is_compressed,
+                    \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
+                  }" > "${results_dir}/summary.json"
+                  
+                  echo "Processed $total_certs certificates for $cidr"
                 else
-                  echo "Created certificate data for $cidr with $total_certs certificates"
+                  echo "Failed to create output file for $cidr"
                 fi
-                
-                # Create summary file
-                jq '{
-                  range: "'"$cidr"'",
-                  total_certificates: '$total_certs',
-                  compressed: '$is_compressed',
-                  scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-                }' > "${results_dir}/summary.json"
               else
                 echo "ZGrab2 scan failed for range: $cidr"
               fi
@@ -203,9 +181,8 @@ jobs:
             rm -f tmp_ips.txt tmp_certs.json
             
             # Commit results
-            git add "$results_dir"
-            if git commit -m "Add certificate scan results for $cidr"; then
-              git pull --rebase origin main
-              git push origin main || echo "Failed to push results for $cidr"
-            fi
+            git add "$results_dir/"
+            git commit -m "Add certificate scan results for $cidr" || true
+            git pull --rebase origin main
+            git push origin main || echo "Failed to push results for $cidr"
           done < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
