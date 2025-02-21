@@ -52,55 +52,65 @@ jobs:
             local temp_file="temp_processed.json"
             : > "$temp_file"
             
-            # Process each line and clean nulls
             while IFS= read -r line; do
               if [ -n "$line" ]; then
                 echo "$line" | jq -c '
                   select(.data != null and .data.tls != null) | 
+                  select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name != null) |
                   {
                     ip,
                     tls: (.data.tls | {
                       protocol_version: .result.handshake_log.server_hello.version.name,
-                      cipher_suite: (.result.handshake_log.server_hello.cipher_suite | {
-                        name: .name,
-                        value: .value
-                      }),
+                      cipher_suite: (
+                        select(.result.handshake_log.server_hello.cipher_suite != null) |
+                        .result.handshake_log.server_hello.cipher_suite | {
+                          name,
+                          value
+                        }
+                      ),
                       certificate_details: (.result.handshake_log.server_certificates.certificate.parsed | {
-                        validity: (.validity | {
+                        validity: (select(.validity != null) | .validity | {
                           start,
                           end
                         }),
-                        issuer: {
-                          common_name: .issuer.common_name[0],
-                          organization: .issuer.organization[0],
-                          country: .issuer.country[0]
-                        },
-                        subject: {
-                          common_name: .subject.common_name[0]
-                        },
-                        public_key: (.subject_key_info | {
+                        issuer: (select(.issuer != null) | .issuer | {
+                          common_name: .common_name[0],
+                          organization: .organization[0],
+                          country: .country[0]
+                        }),
+                        subject: (select(.subject != null) | .subject | {
+                          common_name: .common_name[0]
+                        }),
+                        public_key: (select(.subject_key_info != null) | .subject_key_info | {
                           algorithm: .key_algorithm.name,
                           length: .rsa_public_key.length
                         }),
-                        extensions: (.extensions | {
-                          basic_constraints: { is_ca },
-                          key_usage: { digital_signature, key_encipherment },
-                          subject_alt_name: { dns_names }
-                        }),
-                        security_features: (.result.handshake_log.server_hello | {
+                        extensions: (select(.extensions != null) | .extensions | {
+                          basic_constraints: (select(.basic_constraints != null) | .basic_constraints | {
+                            is_ca
+                          }),
+                          key_usage: (select(.key_usage != null) | .key_usage | {
+                            digital_signature,
+                            key_encipherment
+                          }),
+                          subject_alt_name: (select(.subject_alt_name != null) | .subject_alt_name | {
+                            dns_names
+                          })
+                        } | select(.[] != {})),
+                        security_features: (.result.handshake_log.server_hello | select(. != null) | {
                           ocsp_stapling,
                           secure_renegotiation,
                           extended_master_secret
-                        }),
-                        signature: (.signature | {
+                        } | select(. != {})),
+                        signature: (select(.signature != null) | .signature | {
                           algorithm: .signature_algorithm.name,
                           valid
                         })
-                      }),
+                      } | select(. != {})),
                       security_audit: {
                         certificate_chain: [
                           .result.handshake_log.server_certificates.chain[]? | 
-                          select(. != null) | {
+                          select(. != null and .parsed != null) | {
                             issuer_common_name: .parsed.issuer.common_name[0],
                             valid: .parsed.signature.valid
                           }
@@ -108,20 +118,20 @@ jobs:
                         browser_trusted: .result.handshake_log.server_certificates.validation.browser_trusted
                       }
                     })
-                  } | del(..|nulls)' >> "$temp_file" || true
+                  } | select(.tls.certificate_details != null)' >> "$temp_file" || true
               fi
             done < "$input_file"
             
             if [ -s "$temp_file" ]; then
-              # Filter out empty objects and arrays
+              # Remove empty objects and do final cleanup
               jq -s '
-                map(select(. != null) | with_entries(
+                map(
                   select(
-                    .value != null and 
-                    .value != [] and 
-                    (.value | type == "object" | not or . != {})
+                    .tls.certificate_details != null and
+                    .tls.certificate_details.subject != null and
+                    .tls.certificate_details.subject.common_name != null
                   )
-                )) |
+                ) |
                 {
                   certificates: .,
                   total_count: length,
@@ -138,7 +148,7 @@ jobs:
             rm -f "$temp_file"
           }
 
-          # Process each range
+          # Rest of script remains the same...
           START_LINE=${{ inputs.start_line }}
           END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
           
