@@ -1,12 +1,14 @@
 {
-  "scan_time": "2025-02-21T12:43:56Z",
+  "scan_time": "2025-02-21T12:49:12Z",
   "ranges_processed": 1,
-  "total_certificates": 545,
+  "total_certificates": 448,
+  "browser_trusted_certificates": 0,
   "ranges": [
     {
       "range": "5.22.160.0/19",
-      "total_certificates": 545,
-      "scan_time": "2025-02-21T12:43:56Z"
+      "total_certificates": 448,
+      "browser_trusted_certificates": 0,
+      "scan_time": "2025-02-21T12:49:12Z"
     }
   ]
 }
