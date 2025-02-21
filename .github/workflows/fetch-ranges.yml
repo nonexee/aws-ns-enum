@@ -2,8 +2,6 @@ name: Fetch EC2 Ranges
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *'  # Run daily at midnight
 
 jobs:
   fetch-ranges:
@@ -11,6 +9,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          persist-credentials: true
 
       - name: Install dependencies
         run: |
@@ -19,28 +19,30 @@ jobs:
 
       - name: Download and process EC2 IP ranges
         run: |
-          # Download and extract EC2 ranges
-          curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | \
-          jq -r '.prefixes[] | select(.service=="EC2") | .ip_prefix' > ec2_ranges.txt
+          echo "Downloading IP ranges from AWS..."
+          curl -s https://ip-ranges.amazonaws.com/ip-ranges.json > ip-ranges.json
           
-          # Count ranges
-          count=$(wc -l < ec2_ranges.txt)
-          echo "Found $count EC2 ranges"
+          echo "Extracting EC2 ranges..."
+          jq -r '.prefixes[] | select(.service=="EC2") | .ip_prefix' ip-ranges.json > ec2_ranges.txt
           
-          # Show first few ranges as debug info
-          echo "First 5 ranges:"
-          head -n 5 ec2_ranges.txt
+          echo "Content of ec2_ranges.txt:"
+          cat ec2_ranges.txt
+          
+          echo "Total ranges found: $(wc -l < ec2_ranges.txt)"
 
-      - name: Commit and push if changed
+      - name: Commit and push changes
         run: |
+          echo "Configuring git..."
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          # Only commit if there are changes
-          if git diff --quiet ec2_ranges.txt; then
-            echo "No changes to EC2 ranges"
-          else
-            git add ec2_ranges.txt
-            git commit -m "Update EC2 ranges $(date +'%Y-%m-%d')"
-            git push
-          fi
+          echo "Adding file to git..."
+          git add ec2_ranges.txt
+          
+          echo "Committing changes..."
+          git commit -m "Update EC2 ranges $(date +'%Y-%m-%d')"
+          
+          echo "Pushing changes..."
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
