@@ -111,7 +111,7 @@ jobs:
             local size_mb=$((file_size / 1024 / 1024))
             
             echo "Results file is ${size_mb}MB"
-            if [ $size_mb -gt 10 ]; then
+            if [ $size_mb -gt 5 ]; then
                 echo "Compressing large results file..."
                 gzip -9c "$temp_json" > "${results_dir}/certs.json.gz"
                 jq '{
