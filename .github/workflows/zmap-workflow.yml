@@ -37,7 +37,6 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          # Make sure we're on a clean state
           git fetch origin
           git reset --hard origin/main
 
@@ -49,19 +48,21 @@ jobs:
             local cidr="$2"
             local timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
             
-            # Count successful lines
-            local total_ips=$(wc -l < tmp_open_ips.csv || echo "0")
+            # Convert raw IPs to JSON array
+            jq -Rn '
+              [inputs | select(length>0)]
+            ' < tmp_open_ips.csv > tmp_ips.json
             
-            # Create JSON output
-            jq -n --arg cidr "$cidr" \
-               --arg time "$timestamp" \
-               --arg total "$total_ips" \
-               --slurpfile ips tmp_open_ips.csv \
+            # Create JSON output with proper structure
+            jq -n \
+              --arg cidr "$cidr" \
+              --arg time "$timestamp" \
+              --slurpfile ips tmp_ips.json \
               '{
                 range: $cidr,
                 scan_time: $time,
-                total_ips: ($total|tonumber),
-                ips: $ips
+                total_ips: ($ips[0] | length),
+                ips: $ips[0]
               }' > "$result_file"
           }
 
@@ -86,7 +87,7 @@ jobs:
                 echo "Found open ports, processing results..."
                 process_zmap_results "$result_file" "$cidr"
                 
-                # Create summary file
+                # Get and display results
                 total_ips=$(jq '.total_ips' "$result_file")
                 echo "Scan completed successfully for $cidr - Found $total_ips active hosts"
                 
@@ -111,16 +112,16 @@ jobs:
             fi
             
             # Cleanup temporary files
-            rm -f tmp_open_ips.csv
+            rm -f tmp_open_ips.csv tmp_ips.json
             
-            # Commit and push after each range
+            # Add to summary and commit
             if [ -f "$result_file" ]; then
-              # Create summary.json if it doesn't exist
+              # Create or update summary file
               if [ ! -f "zmap_results/summary.json" ]; then
-                echo '{"scans":[]}' > "zmap_results/summary.json"
+                echo '{"scans":[], "last_updated": ""}' > "zmap_results/summary.json"
               fi
               
-              # Update summary.json
+              # Update summary with atomic operation
               jq --arg range "$cidr" \
                  --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
                  --arg total "$(jq '.total_ips' "$result_file")" \
@@ -128,20 +129,17 @@ jobs:
                   range: $range,
                   scan_time: $time,
                   total_ips: ($total|tonumber)
-                }]' "zmap_results/summary.json" > "zmap_results/summary.json.tmp" && \
+                }] | .last_updated = $time' "zmap_results/summary.json" > "zmap_results/summary.json.tmp" && \
               mv "zmap_results/summary.json.tmp" "zmap_results/summary.json"
               
-              # Try to commit and push changes
+              # Commit changes
               git add "$result_file" "zmap_results/summary.json"
               if git commit -m "Add ZMap scan results for $cidr"; then
-                # Attempt to push, if fails, pull and try again
-                if ! git push origin main; then
-                  echo "Push failed, trying to merge remote changes..."
-                  git pull --rebase origin main
-                  git push origin main || {
-                    echo "Failed to push even after rebase. Storing results locally."
-                  }
-                fi
+                git pull --rebase origin main || {
+                  echo "Failed to rebase, attempting merge..."
+                  git pull origin main
+                }
+                git push origin main || echo "Failed to push changes for $cidr"
               fi
             fi
           done < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
