@@ -21,6 +21,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           persist-credentials: true
+          fetch-depth: 0
 
       - name: Setup workspace
         run: |
@@ -30,39 +31,45 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq parallel
+          sudo apt-get install -y jq
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          # Make sure we're on a clean state
+          git fetch origin
+          git reset --hard origin/main
 
       - name: Process ranges with ZMap
         run: |
-          # Function to process ZMap results
+          # Helper function to process ZMap results
           process_zmap_results() {
-            local input_file=$1
-            local cidr=$2
-            local output_file=$3
+            local result_file="$1"
+            local cidr="$2"
+            local timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
             
-            # Convert to JSON format with metadata
-            jq -Rn --arg cidr "$cidr" --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" '
-              reduce inputs as $line ({ips: [], count: 0};
-                if ($line | length) > 0 then
-                  .ips += [$line] | .count += 1
-                else
-                  .
-                end
-              ) | {
+            # Count successful lines
+            local total_ips=$(wc -l < tmp_open_ips.csv || echo "0")
+            
+            # Create JSON output
+            jq -n --arg cidr "$cidr" \
+               --arg time "$timestamp" \
+               --arg total "$total_ips" \
+               --slurpfile ips tmp_open_ips.csv \
+              '{
                 range: $cidr,
                 scan_time: $time,
-                total_ips: .count,
-                ips: .ips
-              }' < "$input_file" > "$output_file"
+                total_ips: ($total|tonumber),
+                ips: $ips
+              }' > "$result_file"
           }
 
-          # Process each range
           START_LINE=${{ inputs.start_line }}
           END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
           
-          readarray -t RANGES < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
-          
-          for cidr in "${RANGES[@]}"; do
+          # Process each range
+          while IFS= read -r cidr; do
             [ -z "$cidr" ] && continue
             
             echo "Processing range: $cidr"
@@ -77,7 +84,7 @@ jobs:
               
               if [ -s tmp_open_ips.csv ]; then
                 echo "Found open ports, processing results..."
-                process_zmap_results "tmp_open_ips.csv" "$cidr" "$result_file"
+                process_zmap_results "$result_file" "$cidr"
                 
                 # Create summary file
                 total_ips=$(jq '.total_ips' "$result_file")
@@ -85,7 +92,6 @@ jobs:
                 
               else
                 echo "No open ports found for range: $cidr"
-                # Create empty result file
                 echo "{
                   \"range\": \"$cidr\",
                   \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
@@ -95,7 +101,6 @@ jobs:
               fi
             else
               echo "ZMap scan failed for range: $cidr"
-              # Create error result file
               echo "{
                 \"range\": \"$cidr\",
                 \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
@@ -107,42 +112,36 @@ jobs:
             
             # Cleanup temporary files
             rm -f tmp_open_ips.csv
-          done
-          
-          # Create summary file
-          echo "Creating summary file..."
-          jq -s '{
-            scan_time: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
-            ranges_processed: length,
-            total_ips_found: (map(.total_ips) | add),
-            ranges: map({
-              range: .range,
-              total_ips: .total_ips,
-              scan_time: .scan_time,
-              error: .error?
-            })
-          }' zmap_results/*.json > zmap_results/summary.json
-          
-          # Commit results with retry logic
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          
-          MAX_RETRIES=3
-          RETRY_COUNT=0
-          
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            if git add zmap_results/ && \
-               git commit -m "Add ZMap scan results for ranges $START_LINE-$END_LINE" && \
-               git push; then
-              break
-            else
-              RETRY_COUNT=$((RETRY_COUNT + 1))
-              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                echo "Push failed, retrying... (Attempt $RETRY_COUNT of $MAX_RETRIES)"
-                git pull --rebase
-              else
-                echo "Failed to push after $MAX_RETRIES attempts"
-                exit 1
+            
+            # Commit and push after each range
+            if [ -f "$result_file" ]; then
+              # Create summary.json if it doesn't exist
+              if [ ! -f "zmap_results/summary.json" ]; then
+                echo '{"scans":[]}' > "zmap_results/summary.json"
+              fi
+              
+              # Update summary.json
+              jq --arg range "$cidr" \
+                 --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+                 --arg total "$(jq '.total_ips' "$result_file")" \
+                '.scans += [{
+                  range: $range,
+                  scan_time: $time,
+                  total_ips: ($total|tonumber)
+                }]' "zmap_results/summary.json" > "zmap_results/summary.json.tmp" && \
+              mv "zmap_results/summary.json.tmp" "zmap_results/summary.json"
+              
+              # Try to commit and push changes
+              git add "$result_file" "zmap_results/summary.json"
+              if git commit -m "Add ZMap scan results for $cidr"; then
+                # Attempt to push, if fails, pull and try again
+                if ! git push origin main; then
+                  echo "Push failed, trying to merge remote changes..."
+                  git pull --rebase origin main
+                  git push origin main || {
+                    echo "Failed to push even after rebase. Storing results locally."
+                  }
+                fi
               fi
             fi
-          done
+          done < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
