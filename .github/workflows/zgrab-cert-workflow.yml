@@ -25,10 +25,8 @@ jobs:
 
       - name: Configure Git
         run: |
-          # Set git config with explicit user details
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
-          # Ensure we're on the right branch
           git fetch origin
           git reset --hard origin/main
 
@@ -44,11 +42,80 @@ jobs:
 
       - name: Process ranges with ZGrab2
         run: |
+          split_and_compress_results() {
+            local input_file="$1"
+            local results_dir="$2"
+            local chunk_size=$((2 * 1024 * 1024))  # 2MB in bytes
+            
+            # Get total certificates and metadata
+            local total_count=$(jq '.total_count' "$input_file")
+            local scan_time=$(jq -r '.scan_time' "$input_file")
+            local file_size=$(stat -f%z "$input_file" 2>/dev/null || stat -c%s "$input_file")
+            local size_mb=$((file_size / 1024 / 1024))
+            
+            echo "Processing file of size ${size_mb}MB..."
+            
+            if [ $size_mb -gt 5 ]; then
+                echo "Splitting into 2MB chunks..."
+                
+                # Calculate certificates per chunk based on file size ratio
+                local certs_per_chunk=$((total_count * chunk_size / file_size))
+                local chunk_number=0
+                
+                # Create metadata file
+                jq '{
+                    total_count: .total_count,
+                    scan_time: .scan_time,
+                    split: true,
+                    original_size_mb: '$size_mb',
+                    chunks: []
+                }' "$input_file" > "${results_dir}/certs.json"
+                
+                # Split and process chunks
+                jq -c '.certificates | _nwise('$certs_per_chunk')' "$input_file" | while read -r chunk; do
+                    chunk_number=$((chunk_number + 1))
+                    local chunk_file="${results_dir}/certs_part_${chunk_number}.json"
+                    local chunk_gz="${results_dir}/certs_part_${chunk_number}.json.gz"
+                    
+                    # Create chunk JSON
+                    echo "{
+                        \"certificates\": ${chunk},
+                        \"part\": ${chunk_number},
+                        \"scan_time\": \"${scan_time}\"
+                    }" | jq '.' > "$chunk_file"
+                    
+                    # Compress chunk
+                    gzip -9 -c "$chunk_file" > "$chunk_gz"
+                    rm -f "$chunk_file"
+                    
+                    # Update metadata with chunk info
+                    local chunk_size=$(stat -f%z "$chunk_gz" 2>/dev/null || stat -c%s "$chunk_gz")
+                    jq --arg part "${chunk_number}" \
+                       --arg size "$((chunk_size / 1024))KB" \
+                    '.chunks += [{
+                        part: $part,
+                        compressed_size: $size
+                    }]' "${results_dir}/certs.json" > "${results_dir}/certs.json.tmp"
+                    mv "${results_dir}/certs.json.tmp" "${results_dir}/certs.json"
+                done
+            else
+                echo "Compressing as single file..."
+                gzip -9 -c "$input_file" > "${results_dir}/certs.json.gz"
+                jq '{
+                    total_count: .total_count,
+                    scan_time: .scan_time,
+                    split: false,
+                    compressed_size: "'$(($(stat -f%z "${results_dir}/certs.json.gz" 2>/dev/null || stat -c%s "${results_dir}/certs.json.gz") / 1024))'KB"
+                }' "$input_file" > "${results_dir}/certs.json"
+            fi
+          }
+
           process_zgrab_output() {
             local input_file="$1"
             local results_dir="$2"
             
             if [ ! -s "$input_file" ]; then
+              echo "Empty or missing input file: $input_file"
               echo '{
                 "certificates": [],
                 "total_count": 0,
@@ -106,24 +173,9 @@ jobs:
                 scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
               }' "$input_file" > "$temp_json"
 
-            # Check file size and compress if needed
-            local file_size=$(stat -f%z "$temp_json" 2>/dev/null || stat -c%s "$temp_json")
-            local size_mb=$((file_size / 1024 / 1024))
-            
-            echo "Results file is ${size_mb}MB"
-            if [ $size_mb -gt 5 ]; then
-                echo "Compressing large results file..."
-                gzip -9c "$temp_json" > "${results_dir}/certs.json.gz"
-                jq '{
-                    total_count: .total_count,
-                    scan_time: .scan_time,
-                    compressed: true,
-                    original_size_mb: '$size_mb'
-                }' "$temp_json" > "${results_dir}/certs.json"
-                rm -f "$temp_json"
-            else
-                mv "$temp_json" "${results_dir}/certs.json"
-            fi
+            # Split and compress results
+            split_and_compress_results "$temp_json" "$results_dir"
+            rm -f "$temp_json"
           }
 
           START_LINE=${{ inputs.start_line }}
@@ -160,23 +212,32 @@ jobs:
                 
                 if [ -f "${results_dir}/certs.json" ]; then
                   total_certs=$(jq '.total_count' "${results_dir}/certs.json")
-                  is_compressed=$(jq -r '.compressed // false' "${results_dir}/certs.json")
+                  is_split=$(jq -r '.split // false' "${results_dir}/certs.json")
                   
-                  echo "{
-                    \"range\": \"$cidr\",
-                    \"total_certificates\": $total_certs,
-                    \"compressed\": $is_compressed,
-                    \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
-                  }" > "${results_dir}/summary.json"
+                  # Create summary file
+                  if [ "$is_split" = "true" ]; then
+                    num_chunks=$(jq '.chunks | length' "${results_dir}/certs.json")
+                    echo "{
+                      \"range\": \"$cidr\",
+                      \"total_certificates\": $total_certs,
+                      \"split\": true,
+                      \"total_chunks\": $num_chunks,
+                      \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
+                    }" > "${results_dir}/summary.json"
+                    echo "Processed $total_certs certificates in $num_chunks chunks for $cidr"
+                  else
+                    echo "{
+                      \"range\": \"$cidr\",
+                      \"total_certificates\": $total_certs,
+                      \"split\": false,
+                      \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
+                    }" > "${results_dir}/summary.json"
+                    echo "Processed $total_certs certificates for $cidr"
+                  fi
                   
-                  echo "Processed $total_certs certificates for $cidr"
-                  
-                  # Stage and commit the results
-                  git add "${results_dir}/certs.json"*
-                  git add "${results_dir}/summary.json"
-                  
+                  # Commit and push results
+                  git add "${results_dir}/"
                   if git commit -m "Add certificate scan results for $cidr"; then
-                    # Try to push, with retries
                     for i in {1..3}; do
                       if git push origin main; then
                         break
