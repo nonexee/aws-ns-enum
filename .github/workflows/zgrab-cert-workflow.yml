@@ -45,7 +45,7 @@ jobs:
           split_and_compress_results() {
             local input_file="$1"
             local results_dir="$2"
-            local chunk_size=$((2 * 1024 * 1024))  # 2MB in bytes
+            local chunk_size=$((90 * 1024 * 1024))  # 2MB in bytes
             
             # Get total certificates and metadata
             local total_count=$(jq '.total_count' "$input_file")
@@ -55,7 +55,7 @@ jobs:
             
             echo "Processing file of size ${size_mb}MB..."
             
-            if [ $size_mb -gt 5 ]; then
+            if [ $size_mb -gt 90 ]; then
                 echo "Splitting into 2MB chunks..."
                 
                 # Calculate certificates per chunk based on file size ratio
