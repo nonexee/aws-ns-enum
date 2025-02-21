@@ -30,87 +30,32 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq parallel
+          sudo apt-get install -y jq
 
       - name: Process ranges with ZGrab2
         run: |
-          # Function to transform ZGrab2 output into a more manageable format
-          transform_zgrab_output() {
-            local input_file=$1
-            local output_file=$2
-            
-            jq -c '
-              def clean_cert_data:
-                if type == "object" then
-                  {
-                    ip: .ip,
-                    data: {
-                      tls: {
-                        status: .data.tls.status,
-                        protocol: .data.tls.protocol,
-                        result: {
-                          handshake_log: {
-                            server_hello: .data.tls.result.handshake_log.server_hello,
-                            server_certificates: {
-                              certificate: .data.tls.result.handshake_log.server_certificates.certificate,
-                              validation: .data.tls.result.handshake_log.server_certificates.validation
-                            }
-                          }
-                        }
+          # Helper function to clean JSON output
+          clean_json_output() {
+            local infile="$1"
+            local outfile="$2"
+            jq -c '{
+              results: [.[] | select(.data.tls != null) | {
+                ip: .ip,
+                data: {
+                  tls: {
+                    status: .data.tls.status,
+                    protocol: .data.tls.protocol,
+                    result: {
+                      handshake_log: {
+                        server_hello: .data.tls.result.handshake_log.server_hello,
+                        server_certificates: .data.tls.result.handshake_log.server_certificates
                       }
                     }
                   }
-                else
-                  .
-                end;
-
-              {
-                results: [inputs | clean_cert_data],
-                scan_time: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
-              }
-            ' "$input_file" > "$output_file"
-          }
-
-          # Function to split large JSON results
-          split_results() {
-            local input_file=$1
-            local base_name=$2
-            local chunk_size=500
-            
-            echo "Splitting results for $base_name"
-            mkdir -p "cert_results/$base_name"
-            
-            total_results=$(jq '.results | length' "$input_file")
-            
-            if [ "$total_results" -eq 0 ]; then
-              echo "No results to split"
-              echo '{"results":[],"scan_time":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"}' > \
-                "cert_results/$base_name/part_000.json"
-              return
-            fi
-            
-            # Split into chunks using parallel
-            seq 0 $chunk_size $((total_results - 1)) | parallel -j4 bash -c '
-              i=$0
-              end=$((i + '$chunk_size'))
-              part_num=$(printf "%03d" $((i / '$chunk_size')))
-              
-              jq -c "{
-                results: .results[$i:$end],
-                range: \"'$base_name'\",
-                scan_time: .scan_time,
-                part: \"$part_num\",
-                total_parts: $(((('$total_results' + '$chunk_size' - 1) / '$chunk_size')))
-              }" "'$input_file'" > "'cert_results/$base_name/part_$part_num.json'"
-            '
-            
-            # Create manifest
-            echo "{
-              \"range\": \"$base_name\",
-              \"total_results\": $total_results,
-              \"total_parts\": $(((total_results + chunk_size - 1) / chunk_size)),
-              \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
-            }" > "cert_results/${base_name}_manifest.json"
+                }
+              }],
+              scan_time: (now | strftime("%Y-%m-%dT%H:%M:%SZ"))
+            }' "$infile" > "$outfile"
           }
 
           # Process each range
@@ -132,67 +77,87 @@ jobs:
               continue
             fi
             
+            # Create directory for results
+            mkdir -p "cert_results/${safe_name}"
+            
             # Extract IPs from ZMap results
             jq -r '.ips[]' "$zmap_result" > "tmp_ips.txt"
             
             if [ -s tmp_ips.txt ]; then
               echo "Running ZGrab2 for ${safe_name}..."
+              
+              # Run ZGrab2 with proper error handling
               if docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
                 sec32/zgrab2 zgrab2 tls --port 443 \
                 --timeout 10s \
                 --input-file=/data/tmp_ips.txt \
                 --output-file=/data/tmp_certs.json; then
                 
-                # Transform and clean the output
-                transform_zgrab_output "tmp_certs.json" "enriched_certs.json"
+                echo "Processing ZGrab2 results..."
                 
-                # Split results
-                split_results "enriched_certs.json" "$safe_name"
+                # Clean and transform the results
+                clean_json_output "tmp_certs.json" "cert_results/${safe_name}/results.json"
+                
+                # Create a manifest file
+                total_results=$(jq '.results | length' "cert_results/${safe_name}/results.json")
+                echo "{
+                  \"range\": \"$cidr\",
+                  \"total_results\": $total_results,
+                  \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
+                }" > "cert_results/${safe_name}/manifest.json"
+                
+                echo "Processed $total_results certificates for $cidr"
               else
                 echo "ZGrab2 scan failed for range: $cidr"
-                continue
+                echo "{
+                  \"range\": \"$cidr\",
+                  \"error\": \"zgrab2_scan_failed\",
+                  \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
+                }" > "cert_results/${safe_name}/manifest.json"
               fi
             else
               echo "No IPs found in ZMap results for range: $cidr"
+              echo "{
+                \"range\": \"$cidr\",
+                \"total_results\": 0,
+                \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
+              }" > "cert_results/${safe_name}/manifest.json"
             fi
             
             # Cleanup temporary files
-            rm -f tmp_ips.txt tmp_certs.json enriched_certs.json
+            rm -f tmp_ips.txt tmp_certs.json
           done
           
           # Create summary file
           echo "Creating summary file..."
-          jq -s '{
-            scan_time: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
-            ranges_processed: length,
-            ranges: map({
-              range: .range,
-              total_results: .total_results,
-              total_parts: .total_parts,
-              scan_time: .scan_time
-            })
-          }' cert_results/*_manifest.json > cert_results/summary.json
+          find cert_results -name manifest.json -exec cat {} \; | \
+            jq -s '{
+              scan_time: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
+              ranges_processed: length,
+              total_results: (map(.total_results // 0) | add),
+              ranges: map({
+                range: .range,
+                total_results: (.total_results // 0),
+                error: .error?,
+                scan_time: .scan_time
+              })
+            }' > cert_results/summary.json
           
-          # Commit results with retry logic
+          # Commit results
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          MAX_RETRIES=3
-          RETRY_COUNT=0
-          
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            if git add cert_results/ && \
-               git commit -m "Add certificate scan results for ranges $START_LINE-$END_LINE" && \
-               git push; then
-              break
+          if git add cert_results/ && \
+             git commit -m "Add certificate scan results for ranges $START_LINE-$END_LINE" && \
+             git push; then
+            echo "Successfully committed and pushed results"
+          else
+            echo "Failed to commit results, trying with rebase..."
+            git pull --rebase
+            if git push; then
+              echo "Successfully pushed results after rebase"
             else
-              RETRY_COUNT=$((RETRY_COUNT + 1))
-              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                echo "Push failed, retrying... (Attempt $RETRY_COUNT of $MAX_RETRIES)"
-                git pull --rebase
-              else
-                echo "Failed to push after $MAX_RETRIES attempts"
-                exit 1
-              fi
+              echo "Failed to push results even after rebase"
+              exit 1
             fi
-          done
+          fi
