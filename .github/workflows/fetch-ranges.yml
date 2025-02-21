@@ -1,0 +1,46 @@
+name: Fetch EC2 Ranges
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at midnight
+
+jobs:
+  fetch-ranges:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Download and process EC2 IP ranges
+        run: |
+          # Download and extract EC2 ranges
+          curl -s https://ip-ranges.amazonaws.com/ip-ranges.json | \
+          jq -r '.prefixes[] | select(.service=="EC2") | .ip_prefix' > ec2_ranges.txt
+          
+          # Count ranges
+          count=$(wc -l < ec2_ranges.txt)
+          echo "Found $count EC2 ranges"
+          
+          # Show first few ranges as debug info
+          echo "First 5 ranges:"
+          head -n 5 ec2_ranges.txt
+
+      - name: Commit and push if changed
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Only commit if there are changes
+          if git diff --quiet ec2_ranges.txt; then
+            echo "No changes to EC2 ranges"
+          else
+            git add ec2_ranges.txt
+            git commit -m "Update EC2 ranges $(date +'%Y-%m-%d')"
+            git push
+          fi
