@@ -49,8 +49,6 @@ jobs:
             fi
             
             echo "Processing certificates..."
-            
-            # Create a temporary file for processed results
             local temp_file="temp_processed.json"
             : > "$temp_file"
             
@@ -77,7 +75,42 @@ jobs:
                         },
                         subject: {
                           common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] // null)
+                        },
+                        public_key: {
+                          algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name // null),
+                          length: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length // null)
+                        },
+                        extensions: {
+                          basic_constraints: {
+                            is_ca: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.basic_constraints.is_ca // false)
+                          },
+                          key_usage: {
+                            digital_signature: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.digital_signature // false),
+                            key_encipherment: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.key_encipherment // false)
+                          },
+                          subject_alt_name: {
+                            dns_names: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.subject_alt_name.dns_names // [])
+                          }
+                        },
+                        security_features: {
+                          ocsp_stapling: (.data.tls.result.handshake_log.server_hello.ocsp_stapling // false),
+                          secure_renegotiation: (.data.tls.result.handshake_log.server_hello.secure_renegotiation // false),
+                          extended_master_secret: (.data.tls.result.handshake_log.server_hello.extended_master_secret // false)
+                        },
+                        signature: {
+                          algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.signature_algorithm.name // null),
+                          valid: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.valid // false)
                         }
+                      },
+                      security_audit: {
+                        certificate_chain: [
+                          .data.tls.result.handshake_log.server_certificates.chain[]? | 
+                          select(. != null) | {
+                            issuer_common_name: (.parsed.issuer.common_name[0] // null),
+                            valid: (.parsed.signature.valid // false)
+                          }
+                        ],
+                        browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted // false)
                       }
                     }
                   }' >> "$temp_file" || true
@@ -136,11 +169,15 @@ jobs:
                 
                 if [ -f "cert_results/${safe_name}/certs.json" ]; then
                   total_certs=$(jq '.total_count' "cert_results/${safe_name}/certs.json")
+                  trusted_certs=$(jq '[.certificates[].tls.security_audit.browser_trusted] | map(select(. == true)) | length' "cert_results/${safe_name}/certs.json")
                   echo "{
                     \"range\": \"$cidr\",
                     \"total_certificates\": $total_certs,
+                    \"browser_trusted_certificates\": $trusted_certs,
                     \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
                   }" > "cert_results/${safe_name}/summary.json"
+                  
+                  echo "Processed $total_certs certificates ($trusted_certs browser-trusted) for $cidr"
                 else
                   echo "Failed to create output file for $cidr"
                 fi
