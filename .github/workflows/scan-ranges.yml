@@ -15,6 +15,9 @@ jobs:
       - name: Adjust workspace permissions
         run: chmod -R 777 "${{ github.workspace }}"
 
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Find and process unscanned ranges
         shell: bash
         run: |
@@ -22,37 +25,39 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
-          # Function to compress and split large files
-          handle_large_file() {
-            local json_file="$1"
-            local dir_path=$(dirname "$json_file")
-            local base_name=$(basename "$json_file" .json)
-            local archive_name="${base_name}.tar.gz"
+          # Function to split large JSON files
+          split_results() {
+            local input_file="$1"
+            local output_dir="$2"
+            local chunk_size=80000000  # ~80MB to stay safely under GitHub's limit
+
+            # Create a temporary working directory
+            local temp_dir=$(mktemp -d)
             
-            echo "Compressing and splitting file: $json_file"
+            # Extract the results array into separate files
+            jq -c '.results[]' "$input_file" | split -C "$chunk_size" - "$temp_dir/part-"
             
-            # Create tar.gz archive
-            tar -czf "$dir_path/$archive_name" -C "$dir_path" $(basename "$json_file")
-            
-            # Remove original large file
-            rm "$json_file"
-            
-            # Split the archive into 90MB chunks
-            cd "$dir_path"
-            split -b 90M "$archive_name" "${archive_name}.part-"
-            
-            # Remove the original archive
-            rm "$archive_name"
+            # Process each split file into a proper JSON document
+            for part in "$temp_dir"/part-*; do
+              if [ -f "$part" ]; then
+                # Get part number for naming
+                local part_num=$(basename "$part" | sed 's/part-//')
+                local output_file="$output_dir/results_${part_num}.json"
+                
+                # Wrap the content in a proper JSON structure
+                echo "{\"results\":[" > "$output_file"
+                cat "$part" | sed 's/$/,/' | sed '$s/,$//' >> "$output_file"
+                echo "]}" >> "$output_file"
+                
+                echo "Created chunk file: $output_file"
+              fi
+            done
             
             # Create manifest file
-            echo "{
-              \"type\": \"split_compressed\",
-              \"format\": \"tar.gz\",
-              \"original_name\": \"$(basename "$json_file")\",
-              \"parts\": [$(ls "${archive_name}.part-"* | jq -R . | paste -sd,)]
-            }" > "${dir_path}/manifest.json"
+            echo "{\"type\":\"split\",\"files\":[$(ls "$output_dir"/results_*.json | jq -R -s -c 'split("\n")[:-1]')]}" > "$output_dir/manifest.json"
             
-            echo "File has been compressed and split into parts"
+            # Cleanup
+            rm -rf "$temp_dir"
           }
 
           # Process each range directory
@@ -86,22 +91,27 @@ jobs:
             
             if [ -s "$tmp_dir/open_ips.csv" ]; then
               echo "ZMap found open ports, running ZGrab2"
+              # Run ZGrab2 with temporary output file
               docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
                 sec32/zgrab2 zgrab2 tls --port 443 \
                 --input-file="/data/$dir/tmp/open_ips.csv" \
-                --output-file="/data/$dir/certs.json"
+                --output-file="/data/$dir/tmp/full_results.json"
               
-              # Check file size
-              file_size=$(stat -f%z "$dir/certs.json" 2>/dev/null || stat -c%s "$dir/certs.json")
-              if [ "$file_size" -gt $((90 * 1024 * 1024)) ]; then
-                echo "File size exceeds 90MB, splitting..."
-                handle_large_file "$dir/certs.json"
+              # Split the results if needed
+              file_size=$(stat -f%z "$dir/tmp/full_results.json" 2>/dev/null || stat -c%s "$dir/tmp/full_results.json")
+              if [ "$file_size" -gt 90000000 ]; then  # 90MB threshold
+                echo "Large result file detected, splitting into chunks..."
+                split_results "$dir/tmp/full_results.json" "$dir"
+              else
+                mv "$dir/tmp/full_results.json" "$dir/results.json"
+                echo "{\"type\":\"single\",\"file\":\"results.json\"}" > "$dir/manifest.json"
               fi
               
               echo "Completed scanning range: $cidr"
             else
               echo "No open ports found for range: $cidr"
-              echo '{"results":[]}' > "$dir/certs.json"
+              echo "{\"type\":\"single\",\"file\":\"results.json\"}" > "$dir/manifest.json"
+              echo "{\"results\":[]}" > "$dir/results.json"
             fi
             
             # Cleanup temporary files
@@ -111,7 +121,7 @@ jobs:
             git add "$dir"
             git commit -m "Add scan results for range $cidr"
             
-            # Try to push with retry logic
+            # Try to push, with retry logic
             for i in {1..3}; do
               if git push; then
                 break
