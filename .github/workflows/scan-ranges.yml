@@ -1,141 +1,81 @@
-name: Scan EC2 Ranges
+name: Scan EC2 Range
 
 on:
   workflow_dispatch:
+    inputs:
+      start_line:
+        description: 'Start processing from line number (1-based)'
+        required: true
+        type: number
+      batch_size:
+        description: 'Number of ranges to process'
+        required: true
+        type: number
+        default: 2
 
 jobs:
-  scan-ranges:
+  scan-range:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-        with:
-          persist-credentials: true
 
-      - name: Adjust workspace permissions
-        run: chmod -R 777 "${{ github.workspace }}"
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Find and process unscanned ranges
-        shell: bash
+      - name: Setup workspace
         run: |
-          # Setup git configuration
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          mkdir -p scan_results
+          chmod -R 777 "${{ github.workspace }}"
 
-          # Function to split large JSON files
-          split_results() {
-            local input_file="$1"
-            local output_dir="$2"
-            local chunk_size=80000000  # ~80MB to stay under GitHub's limit
-
-            echo "Validating JSON file structure..."
-            if ! jq empty "$input_file" 2>/dev/null; then
-              echo "Error: Invalid JSON file"
-              return 1
-            fi
-
-            # Create results directory
-            mkdir -p "$output_dir/results"
-
-            # Count number of results
-            local total_results=$(jq -r '.results | length' "$input_file")
-            if [ "$total_results" -eq 0 ]; then
-              echo "No results found in file"
-              echo "{\"results\":[]}" > "$output_dir/results/part_0.json"
-              echo "{\"type\":\"split\",\"files\":[\"results/part_0.json\"]}" > "$output_dir/manifest.json"
-              return 0
-            fi
-
-            # Calculate items per chunk (approximately 10MB per 1000 items)
-            local items_per_chunk=8000
-
-            # Split into chunks
-            local chunk=0
-            local start=0
-            
-            while [ $start -lt $total_results ]; do
-              echo "Processing chunk $chunk..."
-              
-              jq -c "{results: .results[$start:$(($start + $items_per_chunk))]}" "$input_file" > "$output_dir/results/part_$chunk.json"
-              
-              start=$(($start + $items_per_chunk))
-              chunk=$(($chunk + 1))
-            done
-
-            # Create manifest file
-            echo "{\"type\":\"split\",\"files\":[$(ls -1 "$output_dir/results" | jq -R -s -c 'split("\n")[:-1] | map("results/" + .)')],\"total_results\":$total_results}" > "$output_dir/manifest.json"
-          }
-
-          # Process each range directory
-          find ranges -type d -mindepth 1 -maxdepth 1 | while read -r dir; do
-            echo "Processing directory: $dir"
-            
-            # Skip if already processed
-            if [ -f "$dir/manifest.json" ]; then
-              echo "Skipping $dir - already processed"
-              continue
-            fi
-            
-            # Verify cidr.txt exists
-            if [ ! -f "$dir/cidr.txt" ]; then
-              echo "Error: cidr.txt not found in $dir"
-              continue
-            fi
-            
-            cidr=$(cat "$dir/cidr.txt")
+      - name: Process ranges
+        run: |
+          # Extract ranges to process
+          start_idx=$((${{ inputs.start_line }} - 1))
+          end_idx=$((start_idx + ${{ inputs.batch_size }}))
+          
+          # Get ranges for this batch
+          mapfile -t ranges < <(sed -n "${start_idx},${end_idx}p" ec2_ranges.txt)
+          
+          for cidr in "${ranges[@]}"; do
             echo "Processing range: $cidr"
             
-            # Create temporary directory
-            tmp_dir="$dir/tmp"
-            mkdir -p "$tmp_dir"
+            # Create safe filename (replace / with _)
+            safe_name=$(echo "$cidr" | tr '/' '_')
             
             # Run ZMap scan
-            echo "Starting ZMap scan for $cidr"
+            echo "Running ZMap scan..."
             docker run --rm --network=host -v "${{ github.workspace }}":/data \
               sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
-              "$cidr" -o "/data/$dir/tmp/open_ips.csv"
+              "$cidr" -o /data/open_ips.csv
             
-            if [ -s "$tmp_dir/open_ips.csv" ]; then
-              echo "ZMap found open ports, running ZGrab2"
-              # Run ZGrab2 with temporary output file
+            # Check if we found any open ports
+            if [ -s open_ips.csv ]; then
+              echo "Found open ports, running ZGrab2..."
+              # Run ZGrab2
               docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
                 sec32/zgrab2 zgrab2 tls --port 443 \
-                --input-file="/data/$dir/tmp/open_ips.csv" \
-                --output-file="/data/$dir/tmp/full_results.json"
+                --input-file=/data/open_ips.csv \
+                --output-file=/data/certs.json
               
-              if [ -f "$dir/tmp/full_results.json" ]; then
-                # Split the results
-                echo "Splitting results into manageable chunks..."
-                split_results "$dir/tmp/full_results.json" "$dir"
-              else
-                echo "Error: ZGrab2 failed to create output file"
-                echo "{\"type\":\"error\",\"message\":\"zgrab2_failed\"}" > "$dir/manifest.json"
-              fi
+              # Compress results
+              echo "Compressing results..."
+              tar czf "scan_results/${safe_name}.tar.gz" certs.json
+              
+              # Cleanup temporary files
+              rm certs.json open_ips.csv
+              
+              echo "Completed range: $cidr"
             else
               echo "No open ports found for range: $cidr"
-              mkdir -p "$dir/results"
-              echo "{\"results\":[]}" > "$dir/results/part_0.json"
-              echo "{\"type\":\"split\",\"files\":[\"results/part_0.json\"],\"total_results\":0}" > "$dir/manifest.json"
+              # Create empty archive to mark as processed
+              echo '{"results":[]}' | tar czf "scan_results/${safe_name}.tar.gz" -C - .
             fi
-            
-            # Cleanup temporary files
-            rm -rf "$tmp_dir"
-            
-            # Commit results
-            git add "$dir"
-            git commit -m "Add scan results for range $cidr"
-            
-            # Try to push, with retry logic
-            for i in {1..3}; do
-              if git push; then
-                break
-              else
-                echo "Push failed, attempt $i of 3. Pulling and retrying..."
-                git pull --rebase
-                sleep 5
-              fi
-            done
           done
+          
+          # Commit results
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add scan_results/
+          git commit -m "Add scan results for ranges ${start_idx}-${end_idx}"
+          git push || {
+            git pull --rebase
+            git push
+          }
