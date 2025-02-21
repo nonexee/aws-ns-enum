@@ -202,7 +202,7 @@ jobs:
             if [ -s tmp_ips.txt ]; then
               echo "Running ZGrab2 for ${safe_name}..."
               
-              if docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
+              if docker run --rm --network=host -v "${{ github.workspace }}":/data \
                 sec32/zgrab2 zgrab2 tls --port 443 \
                 --timeout 10s \
                 --input-file=/data/tmp_ips.txt \
