@@ -29,35 +29,44 @@ jobs:
           split_results() {
             local input_file="$1"
             local output_dir="$2"
-            local chunk_size=80000000  # ~80MB to stay safely under GitHub's limit
+            local chunk_size=80000000  # ~80MB to stay under GitHub's limit
 
-            # Create a temporary working directory
-            local temp_dir=$(mktemp -d)
+            echo "Validating JSON file structure..."
+            if ! jq empty "$input_file" 2>/dev/null; then
+              echo "Error: Invalid JSON file"
+              return 1
+            fi
+
+            # Create results directory
+            mkdir -p "$output_dir/results"
+
+            # Count number of results
+            local total_results=$(jq -r '.results | length' "$input_file")
+            if [ "$total_results" -eq 0 ]; then
+              echo "No results found in file"
+              echo "{\"results\":[]}" > "$output_dir/results/part_0.json"
+              echo "{\"type\":\"split\",\"files\":[\"results/part_0.json\"]}" > "$output_dir/manifest.json"
+              return 0
+            fi
+
+            # Calculate items per chunk (approximately 10MB per 1000 items)
+            local items_per_chunk=8000
+
+            # Split into chunks
+            local chunk=0
+            local start=0
             
-            # Extract the results array into separate files
-            jq -c '.results[]' "$input_file" | split -C "$chunk_size" - "$temp_dir/part-"
-            
-            # Process each split file into a proper JSON document
-            for part in "$temp_dir"/part-*; do
-              if [ -f "$part" ]; then
-                # Get part number for naming
-                local part_num=$(basename "$part" | sed 's/part-//')
-                local output_file="$output_dir/results_${part_num}.json"
-                
-                # Wrap the content in a proper JSON structure
-                echo "{\"results\":[" > "$output_file"
-                cat "$part" | sed 's/$/,/' | sed '$s/,$//' >> "$output_file"
-                echo "]}" >> "$output_file"
-                
-                echo "Created chunk file: $output_file"
-              fi
+            while [ $start -lt $total_results ]; do
+              echo "Processing chunk $chunk..."
+              
+              jq -c "{results: .results[$start:$(($start + $items_per_chunk))]}" "$input_file" > "$output_dir/results/part_$chunk.json"
+              
+              start=$(($start + $items_per_chunk))
+              chunk=$(($chunk + 1))
             done
-            
+
             # Create manifest file
-            echo "{\"type\":\"split\",\"files\":[$(ls "$output_dir"/results_*.json | jq -R -s -c 'split("\n")[:-1]')]}" > "$output_dir/manifest.json"
-            
-            # Cleanup
-            rm -rf "$temp_dir"
+            echo "{\"type\":\"split\",\"files\":[$(ls -1 "$output_dir/results" | jq -R -s -c 'split("\n")[:-1] | map("results/" + .)')],\"total_results\":$total_results}" > "$output_dir/manifest.json"
           }
 
           # Process each range directory
@@ -97,21 +106,19 @@ jobs:
                 --input-file="/data/$dir/tmp/open_ips.csv" \
                 --output-file="/data/$dir/tmp/full_results.json"
               
-              # Split the results if needed
-              file_size=$(stat -f%z "$dir/tmp/full_results.json" 2>/dev/null || stat -c%s "$dir/tmp/full_results.json")
-              if [ "$file_size" -gt 90000000 ]; then  # 90MB threshold
-                echo "Large result file detected, splitting into chunks..."
+              if [ -f "$dir/tmp/full_results.json" ]; then
+                # Split the results
+                echo "Splitting results into manageable chunks..."
                 split_results "$dir/tmp/full_results.json" "$dir"
               else
-                mv "$dir/tmp/full_results.json" "$dir/results.json"
-                echo "{\"type\":\"single\",\"file\":\"results.json\"}" > "$dir/manifest.json"
+                echo "Error: ZGrab2 failed to create output file"
+                echo "{\"type\":\"error\",\"message\":\"zgrab2_failed\"}" > "$dir/manifest.json"
               fi
-              
-              echo "Completed scanning range: $cidr"
             else
               echo "No open ports found for range: $cidr"
-              echo "{\"type\":\"single\",\"file\":\"results.json\"}" > "$dir/manifest.json"
-              echo "{\"results\":[]}" > "$dir/results.json"
+              mkdir -p "$dir/results"
+              echo "{\"results\":[]}" > "$dir/results/part_0.json"
+              echo "{\"type\":\"split\",\"files\":[\"results/part_0.json\"],\"total_results\":0}" > "$dir/manifest.json"
             fi
             
             # Cleanup temporary files
