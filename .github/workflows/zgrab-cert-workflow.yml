@@ -23,6 +23,15 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
 
+      - name: Configure Git
+        run: |
+          # Set git config with explicit user details
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          # Ensure we're on the right branch
+          git fetch origin
+          git reset --hard origin/main
+
       - name: Setup workspace
         run: |
           mkdir -p cert_results
@@ -36,26 +45,23 @@ jobs:
       - name: Process ranges with ZGrab2
         run: |
           process_zgrab_output() {
-            local cert_dir="${1%/*}"       # Extract directory path
-            local cert_file="${1##*/}"     # Extract filename
-            local base_dir="$2"
+            local input_file="$1"
+            local results_dir="$2"
             
-            if [ ! -s "$1" ]; then
-              echo "Empty or missing input file: $1"
+            if [ ! -s "$input_file" ]; then
               echo '{
                 "certificates": [],
                 "total_count": 0,
                 "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-              }' > "${base_dir}/certs.json"
+              }' > "${results_dir}/certs.json"
               return
             fi
             
             echo "Processing certificates..."
-            local temp_json="${base_dir}/temp_certs.json"
+            local temp_json="${results_dir}/temp_certs.json"
             
-            # Process the ZGrab2 output into structured JSON
-            jq -c '
-              select(.data != null and .data.tls != null) |
+            # Process and create initial JSON
+            jq -c '[inputs | select(.data != null and .data.tls != null) |
               select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != null) |
               select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != "") | {
                 ip: .ip,
@@ -94,31 +100,29 @@ jobs:
                     browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted // false)
                   }
                 }
-              }' "$1" | jq -s '{
+              }] | {
                 certificates: .,
                 total_count: length,
                 scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-              }' > "$temp_json"
+              }' "$input_file" > "$temp_json"
 
-            # Check file size
+            # Check file size and compress if needed
             local file_size=$(stat -f%z "$temp_json" 2>/dev/null || stat -c%s "$temp_json")
             local size_mb=$((file_size / 1024 / 1024))
             
             echo "Results file is ${size_mb}MB"
             if [ $size_mb -gt 30 ]; then
                 echo "Compressing large results file..."
-                # Compress the full data
-                gzip -9c "$temp_json" > "${base_dir}/certs.json.gz"
-                # Create metadata file
+                gzip -9c "$temp_json" > "${results_dir}/certs.json.gz"
                 jq '{
                     total_count: .total_count,
                     scan_time: .scan_time,
                     compressed: true,
                     original_size_mb: '$size_mb'
-                }' "$temp_json" > "${base_dir}/certs.json"
+                }' "$temp_json" > "${results_dir}/certs.json"
                 rm -f "$temp_json"
             else
-                mv "$temp_json" "${base_dir}/certs.json"
+                mv "$temp_json" "${results_dir}/certs.json"
             fi
           }
 
@@ -158,7 +162,6 @@ jobs:
                   total_certs=$(jq '.total_count' "${results_dir}/certs.json")
                   is_compressed=$(jq -r '.compressed // false' "${results_dir}/certs.json")
                   
-                  # Create summary file
                   echo "{
                     \"range\": \"$cidr\",
                     \"total_certificates\": $total_certs,
@@ -167,6 +170,22 @@ jobs:
                   }" > "${results_dir}/summary.json"
                   
                   echo "Processed $total_certs certificates for $cidr"
+                  
+                  # Stage and commit the results
+                  git add "${results_dir}/certs.json"*
+                  git add "${results_dir}/summary.json"
+                  
+                  if git commit -m "Add certificate scan results for $cidr"; then
+                    # Try to push, with retries
+                    for i in {1..3}; do
+                      if git push origin main; then
+                        break
+                      else
+                        echo "Push failed, attempt $i of 3. Pulling latest changes..."
+                        git pull --rebase origin main
+                      fi
+                    done
+                  fi
                 else
                   echo "Failed to create output file for $cidr"
                 fi
@@ -179,10 +198,4 @@ jobs:
             
             # Cleanup temporary files
             rm -f tmp_ips.txt tmp_certs.json
-            
-            # Commit results
-            git add "$results_dir/"
-            git commit -m "Add certificate scan results for $cidr" || true
-            git pull --rebase origin main
-            git push origin main || echo "Failed to push results for $cidr"
           done < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
