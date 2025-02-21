@@ -11,7 +11,7 @@ on:
         description: 'Number of ranges to process'
         required: true
         type: number
-        default: 2
+        default: 1
 
 jobs:
   scan-range:
@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          persist-credentials: true
 
       - name: Setup workspace
         run: |
@@ -27,17 +29,24 @@ jobs:
 
       - name: Process ranges
         run: |
-          # Extract ranges to process
-          start_idx=$((${{ inputs.start_line }} - 1))
-          end_idx=$((start_idx + ${{ inputs.batch_size }}))
+          # Calculate line range
+          START_LINE=${{ inputs.start_line }}
+          END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
           
-          # Get ranges for this batch
-          mapfile -t ranges < <(sed -n "${start_idx},${end_idx}p" ec2_ranges.txt)
+          echo "Processing lines $START_LINE to $END_LINE"
           
-          for cidr in "${ranges[@]}"; do
+          # Extract ranges using awk instead of sed
+          readarray -t RANGES < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
+          
+          echo "Found ${#RANGES[@]} ranges to process"
+          
+          for cidr in "${RANGES[@]}"; do
+            # Skip empty lines
+            [ -z "$cidr" ] && continue
+            
             echo "Processing range: $cidr"
             
-            # Create safe filename (replace / with _)
+            # Create safe filename
             safe_name=$(echo "$cidr" | tr '/' '_')
             
             # Run ZMap scan
@@ -49,7 +58,6 @@ jobs:
             # Check if we found any open ports
             if [ -s open_ips.csv ]; then
               echo "Found open ports, running ZGrab2..."
-              # Run ZGrab2
               docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
                 sec32/zgrab2 zgrab2 tls --port 443 \
                 --input-file=/data/open_ips.csv \
@@ -59,23 +67,23 @@ jobs:
               echo "Compressing results..."
               tar czf "scan_results/${safe_name}.tar.gz" certs.json
               
-              # Cleanup temporary files
-              rm certs.json open_ips.csv
+              # Cleanup
+              rm -f certs.json open_ips.csv
               
               echo "Completed range: $cidr"
             else
               echo "No open ports found for range: $cidr"
-              # Create empty archive to mark as processed
-              echo '{"results":[]}' | tar czf "scan_results/${safe_name}.tar.gz" -C - .
+              echo '{"results":[]}' | tar czf "scan_results/${safe_name}.tar.gz" -
             fi
           done
           
-          # Commit results
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add scan_results/
-          git commit -m "Add scan results for ranges ${start_idx}-${end_idx}"
-          git push || {
-            git pull --rebase
+          # Commit results if any were generated
+          if [ -n "$(ls -A scan_results/)" ]; then
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git add scan_results/
+            git commit -m "Add scan results for ranges $START_LINE-$END_LINE"
             git push
-          }
+          else
+            echo "No results were generated"
+          fi
