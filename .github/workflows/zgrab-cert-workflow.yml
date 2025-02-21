@@ -34,23 +34,26 @@ jobs:
 
       - name: Process ranges with ZGrab2
         run: |
-          # Helper function to process ZGrab output
           process_zgrab_output() {
             local input_file="$1"
             local output_file="$2"
             
-            # First check if file exists and is not empty
             if [ ! -s "$input_file" ]; then
               echo "Empty or missing input file: $input_file"
               echo '{
                 "certificates": [],
                 "total_count": 0,
-                "scan_time": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"
+                "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
               }' > "$output_file"
               return
-            }
+            fi
             
-            # Process file line by line to handle potential JSON formatting issues
+            echo "Processing certificates..."
+            
+            # Create a temporary file for processed results
+            local temp_file="temp_processed.json"
+            : > "$temp_file"
+            
             while IFS= read -r line; do
               if [ -n "$line" ]; then
                 echo "$line" | jq -c '
@@ -62,71 +65,46 @@ jobs:
                         name: (.data.tls.result.handshake_log.server_hello.cipher_suite.name // null),
                         value: (.data.tls.result.handshake_log.server_hello.cipher_suite.value // null)
                       },
-                      certificate_details: (.data.tls.result.handshake_log.server_certificates.certificate.parsed | {
+                      certificate_details: {
                         validity: {
-                          start: .validity.start,
-                          end: .validity.end
+                          start: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start // null),
+                          end: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end // null)
                         },
                         issuer: {
-                          common_name: (.issuer.common_name[0] // null),
-                          organization: (.issuer.organization[0] // null),
-                          country: (.issuer.country[0] // null)
+                          common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0] // null),
+                          organization: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.organization[0] // null),
+                          country: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.country[0] // null)
                         },
                         subject: {
-                          common_name: (.subject.common_name[0] // null)
-                        },
-                        public_key: {
-                          algorithm: .subject_key_info.key_algorithm.name,
-                          length: .subject_key_info.rsa_public_key.length
-                        },
-                        extensions: {
-                          basic_constraints: {
-                            is_ca: (.extensions.basic_constraints.is_ca // false)
-                          },
-                          key_usage: {
-                            digital_signature: (.extensions.key_usage.digital_signature // false),
-                            key_encipherment: (.extensions.key_usage.key_encipherment // false)
-                          },
-                          subject_alt_name: {
-                            dns_names: (.extensions.subject_alt_name.dns_names // [])
-                          }
+                          common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] // null)
                         }
-                      } // {}),
-                      security_features: {
-                        ocsp_stapling: (.data.tls.result.handshake_log.server_hello.ocsp_stapling // false),
-                        secure_renegotiation: (.data.tls.result.handshake_log.server_hello.secure_renegotiation // false),
-                        extended_master_secret: (.data.tls.result.handshake_log.server_hello.extended_master_secret // false)
                       }
                     }
-                  }' >> "tmp_processed.json" || true
+                  }' >> "$temp_file" || true
               fi
             done < "$input_file"
             
-            # Combine all processed results into final output
-            if [ -s "tmp_processed.json" ]; then
+            if [ -s "$temp_file" ]; then
               jq -s '{
                 certificates: .,
                 total_count: length,
-                scan_time: "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"
-              }' "tmp_processed.json" > "$output_file"
+                scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
+              }' "$temp_file" > "$output_file"
+              rm -f "$temp_file"
             else
               echo '{
                 "certificates": [],
                 "total_count": 0,
-                "scan_time": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"
+                "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
               }' > "$output_file"
             fi
-            
-            rm -f "tmp_processed.json"
           }
 
           # Process each range
           START_LINE=${{ inputs.start_line }}
           END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
           
-          readarray -t RANGES < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
-          
-          for cidr in "${RANGES[@]}"; do
+          while IFS= read -r cidr; do
             [ -z "$cidr" ] && continue
             
             echo "Processing range: $cidr"
@@ -143,28 +121,21 @@ jobs:
             mkdir -p "cert_results/${safe_name}"
             
             # Extract IPs from ZMap results
-            if ! jq -r '.ips[]?' "$zmap_result" > "tmp_ips.txt" 2>/dev/null; then
-              echo "Error processing ZMap results for $cidr"
-              continue
-            fi
+            jq -r '.ips[]?' "$zmap_result" > "tmp_ips.txt" 2>/dev/null
             
             if [ -s tmp_ips.txt ]; then
               echo "Running ZGrab2 for ${safe_name}..."
               
-              # Run ZGrab2 with proper error handling
               if docker run --rm --network=host -v "${{ github.workspace }}":/data -i \
                 sec32/zgrab2 zgrab2 tls --port 443 \
                 --timeout 10s \
                 --input-file=/data/tmp_ips.txt \
                 --output-file=/data/tmp_certs.json; then
                 
-                echo "Processing ZGrab2 results..."
                 process_zgrab_output "tmp_certs.json" "cert_results/${safe_name}/certs.json"
                 
                 if [ -f "cert_results/${safe_name}/certs.json" ]; then
                   total_certs=$(jq '.total_count' "cert_results/${safe_name}/certs.json")
-                  echo "Processed $total_certs certificates for $cidr"
-                  
                   echo "{
                     \"range\": \"$cidr\",
                     \"total_certificates\": $total_certs,
@@ -182,16 +153,15 @@ jobs:
             
             # Cleanup temporary files
             rm -f tmp_ips.txt tmp_certs.json
-          done
+          done < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
           
           # Commit results
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          if git add cert_results/ && \
-             git commit -m "Add certificate scan results for ranges $START_LINE-$END_LINE"; then
-            git push || {
-              git pull --rebase
-              git push
-            }
-          fi
+          git add cert_results/ || true
+          git commit -m "Add certificate scan results for ranges $START_LINE-$END_LINE" || true
+          git push || {
+            git pull --rebase
+            git push
+          }
