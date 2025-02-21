@@ -259,4 +259,4 @@ jobs:
             
             # Cleanup temporary files
             rm -f tmp_ips.txt tmp_certs.json
-          done < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
+          done < <(awk -v start="$START_LINE" -v end="$END_LINE" 'NR >= start && NR <= end' ec2_ranges.txt)
