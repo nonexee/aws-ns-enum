@@ -21,6 +21,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           persist-credentials: true
+          fetch-depth: 0
 
       - name: Setup workspace
         run: |
@@ -30,13 +31,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq
+          sudo apt-get install -y jq gzip
 
       - name: Process ranges with ZGrab2
         run: |
           process_zgrab_output() {
             local input_file="$1"
-            local output_file="$2"
+            local base_dir="$2"
+            local safe_name="$3"
             
             if [ ! -s "$input_file" ]; then
               echo "Empty or missing input file: $input_file"
@@ -44,98 +46,103 @@ jobs:
                 "certificates": [],
                 "total_count": 0,
                 "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-              }' > "$output_file"
+              }' > "${base_dir}/certs.json"
               return
             fi
             
             echo "Processing certificates..."
-            local temp_file="temp_processed.json"
-            : > "$temp_file"
+            local temp_file="${base_dir}/temp_certs.json"
             
-            while IFS= read -r line; do
-              if [ -n "$line" ]; then
-                echo "$line" | jq -c '
-                  select(.data != null and .data.tls != null) |
-                  select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != null) |
-                  select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != "") | {
-                    ip: .ip,
-                    tls: {
-                      protocol_version: (.data.tls.result.handshake_log.server_hello.version.name // null),
-                      cipher_suite: {
-                        name: (.data.tls.result.handshake_log.server_hello.cipher_suite.name // null),
-                        value: (.data.tls.result.handshake_log.server_hello.cipher_suite.value // null)
+            # Process and create initial JSON
+            jq -c '
+              select(.data != null and .data.tls != null) |
+              select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != null) |
+              select(.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] != "") | {
+                ip: .ip,
+                tls: {
+                  protocol_version: (.data.tls.result.handshake_log.server_hello.version.name // null),
+                  cipher_suite: {
+                    name: (.data.tls.result.handshake_log.server_hello.cipher_suite.name // null),
+                    value: (.data.tls.result.handshake_log.server_hello.cipher_suite.value // null)
+                  },
+                  certificate_details: {
+                    validity: {
+                      start: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start // null),
+                      end: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end // null)
+                    },
+                    issuer: {
+                      common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0] // null),
+                      organization: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.organization[0] // null),
+                      country: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.country[0] // null)
+                    },
+                    subject: {
+                      common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] // null)
+                    },
+                    public_key: {
+                      algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name // null),
+                      length: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length // null)
+                    },
+                    extensions: {
+                      basic_constraints: {
+                        is_ca: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.basic_constraints.is_ca // false)
                       },
-                      certificate_details: {
-                        validity: {
-                          start: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.start // null),
-                          end: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.validity.end // null)
-                        },
-                        issuer: {
-                          common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.common_name[0] // null),
-                          organization: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.organization[0] // null),
-                          country: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.issuer.country[0] // null)
-                        },
-                        subject: {
-                          common_name: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject.common_name[0] // null)
-                        },
-                        public_key: {
-                          algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.key_algorithm.name // null),
-                          length: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.subject_key_info.rsa_public_key.length // null)
-                        },
-                        extensions: {
-                          basic_constraints: {
-                            is_ca: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.basic_constraints.is_ca // false)
-                          },
-                          key_usage: {
-                            digital_signature: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.digital_signature // false),
-                            key_encipherment: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.key_encipherment // false)
-                          },
-                          subject_alt_name: {
-                            dns_names: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.subject_alt_name.dns_names // [])
-                          }
-                        },
-                        security_features: {
-                          ocsp_stapling: (.data.tls.result.handshake_log.server_hello.ocsp_stapling // false),
-                          secure_renegotiation: (.data.tls.result.handshake_log.server_hello.secure_renegotiation // false),
-                          extended_master_secret: (.data.tls.result.handshake_log.server_hello.extended_master_secret // false)
-                        },
-                        signature: {
-                          algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.signature_algorithm.name // null),
-                          valid: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.valid // false)
-                        }
+                      key_usage: {
+                        digital_signature: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.digital_signature // false),
+                        key_encipherment: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.key_usage.key_encipherment // false)
                       },
-                      security_audit: {
-                        certificate_chain: [
-                          .data.tls.result.handshake_log.server_certificates.chain[]? | 
-                          select(. != null) | {
-                            issuer_common_name: (.parsed.issuer.common_name[0] // null),
-                            valid: (.parsed.signature.valid // false)
-                          }
-                        ],
-                        browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted // false)
+                      subject_alt_name: {
+                        dns_names: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.extensions.subject_alt_name.dns_names // [])
                       }
+                    },
+                    security_features: {
+                      ocsp_stapling: (.data.tls.result.handshake_log.server_hello.ocsp_stapling // false),
+                      secure_renegotiation: (.data.tls.result.handshake_log.server_hello.secure_renegotiation // false),
+                      extended_master_secret: (.data.tls.result.handshake_log.server_hello.extended_master_secret // false)
+                    },
+                    signature: {
+                      algorithm: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.signature_algorithm.name // null),
+                      valid: (.data.tls.result.handshake_log.server_certificates.certificate.parsed.signature.valid // false)
                     }
-                  }' >> "$temp_file" || true
-              fi
-            done < "$input_file"
-            
-            if [ -s "$temp_file" ]; then
-              jq -s '{
+                  },
+                  security_audit: {
+                    certificate_chain: [
+                      .data.tls.result.handshake_log.server_certificates.chain[]? | 
+                      select(. != null) | {
+                        issuer_common_name: (.parsed.issuer.common_name[0] // null),
+                        valid: (.parsed.signature.valid // false)
+                      }
+                    ],
+                    browser_trusted: (.data.tls.result.handshake_log.server_certificates.validation.browser_trusted // false)
+                  }
+                }
+              }' "$input_file" | jq -s '{
                 certificates: .,
                 total_count: length,
                 scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-              }' "$temp_file" > "$output_file"
-              rm -f "$temp_file"
+              }' > "$temp_file"
+
+            # Check file size and compress if needed
+            local file_size=$(stat -f%z "$temp_file" 2>/dev/null || stat -c%s "$temp_file")
+            local size_mb=$((file_size / 1024 / 1024))
+            
+            if [ $size_mb -gt 30 ]; then
+              echo "Results file is ${size_mb}MB, compressing..."
+              # Create compressed version
+              gzip -9 -c "$temp_file" > "${base_dir}/certs.json.gz"
+              # Create small metadata file
+              jq '{
+                total_count: .total_count,
+                scan_time: .scan_time,
+                compressed: true,
+                original_size_mb: '$size_mb'
+              }' "$temp_file" > "${base_dir}/certs.json"
+              rm "$temp_file"
             else
-              echo '{
-                "certificates": [],
-                "total_count": 0,
-                "scan_time": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-              }' > "$output_file"
+              mv "$temp_file" "${base_dir}/certs.json"
             fi
           }
 
-          # Rest of the script remains the same...
+          # Process each range
           START_LINE=${{ inputs.start_line }}
           END_LINE=$((START_LINE + ${{ inputs.batch_size }} - 1))
           
@@ -144,14 +151,17 @@ jobs:
             
             echo "Processing range: $cidr"
             safe_name=$(echo "$cidr" | tr '/' '_')
+            results_dir="cert_results/${safe_name}"
+            mkdir -p "$results_dir"
             
+            # Check if ZMap results exist
             zmap_result="zmap_results/${safe_name}.json"
             if [ ! -f "$zmap_result" ]; then
               echo "No ZMap results found for $cidr, skipping..."
               continue
             fi
             
-            mkdir -p "cert_results/${safe_name}"
+            # Extract IPs from ZMap results
             jq -r '.ips[]?' "$zmap_result" > "tmp_ips.txt" 2>/dev/null
             
             if [ -s tmp_ips.txt ]; then
@@ -163,22 +173,25 @@ jobs:
                 --input-file=/data/tmp_ips.txt \
                 --output-file=/data/tmp_certs.json; then
                 
-                process_zgrab_output "tmp_certs.json" "cert_results/${safe_name}/certs.json"
+                process_zgrab_output "tmp_certs.json" "$results_dir" "$safe_name"
                 
-                if [ -f "cert_results/${safe_name}/certs.json" ]; then
-                  total_certs=$(jq '.total_count' "cert_results/${safe_name}/certs.json")
-                  trusted_certs=$(jq '[.certificates[].tls.security_audit.browser_trusted] | map(select(. == true)) | length' "cert_results/${safe_name}/certs.json")
-                  echo "{
-                    \"range\": \"$cidr\",
-                    \"total_certificates\": $total_certs,
-                    \"browser_trusted_certificates\": $trusted_certs,
-                    \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
-                  }" > "cert_results/${safe_name}/summary.json"
-                  
-                  echo "Processed $total_certs certificates ($trusted_certs browser-trusted) for $cidr"
+                # Get results and create summary
+                local total_certs=$(jq '.total_count' "${results_dir}/certs.json")
+                local is_compressed=$(jq -r '.compressed // false' "${results_dir}/certs.json")
+                
+                if [ "$is_compressed" = "true" ]; then
+                  echo "Created compressed certificate data for $cidr with $total_certs certificates"
                 else
-                  echo "Failed to create output file for $cidr"
+                  echo "Created certificate data for $cidr with $total_certs certificates"
                 fi
+                
+                # Create summary file
+                jq '{
+                  range: "'"$cidr"'",
+                  total_certificates: '$total_certs',
+                  compressed: '$is_compressed',
+                  scan_time: "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
+                }' > "${results_dir}/summary.json"
               else
                 echo "ZGrab2 scan failed for range: $cidr"
               fi
@@ -186,15 +199,13 @@ jobs:
               echo "No IPs found in ZMap results for range: $cidr"
             fi
             
+            # Cleanup temporary files
             rm -f tmp_ips.txt tmp_certs.json
+            
+            # Commit results
+            git add "$results_dir"
+            if git commit -m "Add certificate scan results for $cidr"; then
+              git pull --rebase origin main
+              git push origin main || echo "Failed to push results for $cidr"
+            fi
           done < <(awk "NR >= $START_LINE && NR <= $END_LINE" ec2_ranges.txt)
-          
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          
-          git add cert_results/ || true
-          git commit -m "Add certificate scan results for ranges $START_LINE-$END_LINE" || true
-          git push || {
-            git pull --rebase
-            git push
-          }
