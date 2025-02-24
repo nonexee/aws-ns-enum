@@ -274,81 +274,58 @@ jobs:
       - name: Cleanup running scans file
         if: always()
         run: |
-          # Function to verify scan completion
-          verify_scan() {
-            local cidr="$1"
-            local safe_name=$(echo "$cidr" | tr '/' '_')
-            local result_file="zmap_results/${safe_name}.json"
-            
-            # Check if result file exists and is valid
-            if [ -f "$result_file" ]; then
-              echo "Found result file for $cidr"
-              return 0
-            fi
-            
-            echo "Result file not found for $cidr"
-            return 1
-          }
-
+          echo "Starting cleanup of running scans file..."
+          
           # Reset git state first
           git fetch origin main
           git checkout main -f
           git reset --hard origin/main
           git clean -fd
+          
+          # Setup git identity
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
 
-          # Read our running scans file
+          # Define running scans file path
           RUNNING_SCANS_FILE=".github/running_scans/workflow_${{ github.run_id }}.txt"
+          
+          echo "Checking for running scans file: $RUNNING_SCANS_FILE"
+          
+          # Check if file exists
           if [ -f "$RUNNING_SCANS_FILE" ]; then
-            INCOMPLETE_SCANS=()
+            echo "Found running scans file. Removing it..."
             
-            # Check each CIDR in our running scans file
-            while IFS= read -r cidr; do
-              if [ -n "$cidr" ]; then
-                if ! verify_scan "$cidr"; then
-                  INCOMPLETE_SCANS+=("$cidr")
-                  echo "Warning: Scan for $cidr appears incomplete"
+            # Remove the file
+            rm -f "$RUNNING_SCANS_FILE"
+            
+            # Stage the deletion
+            git add --all .github/running_scans/
+            
+            # Commit the deletion
+            if git commit -m "Remove running scans file for workflow ${{ github.run_id }}"; then
+              echo "Changes committed. Pushing to repository..."
+              
+              # Push with retry logic
+              max_retries=3
+              for retry in $(seq 1 $max_retries); do
+                if git push origin main; then
+                  echo "Successfully removed running scans file"
+                  break
                 else
-                  echo "Verified completed scan for $cidr"
+                  if [ $retry -eq $max_retries ]; then
+                    echo "Failed to push changes after $max_retries attempts"
+                  else
+                    echo "Push failed, retrying ($retry/$max_retries)..."
+                    git pull --rebase origin main
+                    sleep 3
+                  fi
                 fi
-              fi
-            done < "$RUNNING_SCANS_FILE"
-            
-            # If we have incomplete scans, update the running scans file
-            if [ ${#INCOMPLETE_SCANS[@]} -gt 0 ]; then
-              echo "Some scans are incomplete. Updating running scans file..."
-              > "$RUNNING_SCANS_FILE"  # Clear the file
-              for cidr in "${INCOMPLETE_SCANS[@]}"; do
-                echo "$cidr" >> "$RUNNING_SCANS_FILE"
               done
-              
-              git add "$RUNNING_SCANS_FILE"
-              git commit -m "Update running scans file - ${#INCOMPLETE_SCANS[@]} incomplete scans remain"
             else
-              echo "All scans completed successfully. Removing running scans file..."
-              git rm -f "$RUNNING_SCANS_FILE" || rm -f "$RUNNING_SCANS_FILE"
-              git commit -m "Remove completed running scans file for workflow ${{ github.run_id }}"
+              echo "No changes to commit or commit failed"
             fi
-            
-            # Try to push changes, with retry logic
-            max_retries=3
-            retry_count=0
-            while [ $retry_count -lt $max_retries ]; do
-              if git push origin main; then
-                echo "Successfully pushed cleanup changes"
-                break
-              fi
-              
-              # If push fails, pull and try again
-              git pull --rebase origin main
-              
-              retry_count=$((retry_count + 1))
-              if [ $retry_count -lt $max_retries ]; then
-                echo "Push failed, retrying..."
-                sleep 3
-              fi
-            done
           else
-            echo "No running scans file found for this workflow"
+            echo "Running scans file not found for this workflow"
           fi
 
       - name: Trigger next batch if more ranges available
