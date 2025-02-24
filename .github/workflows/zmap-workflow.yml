@@ -12,6 +12,9 @@ on:
 jobs:
   zmap-scan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -37,6 +40,8 @@ jobs:
           git config --local gc.auto 0
           git config --local core.autocrlf false
           git fetch origin
+          git checkout main
+          git pull origin main
 
       - name: Find next available ranges
         id: range_finder
@@ -97,12 +102,69 @@ jobs:
           
           # Commit running scans file
           git add ".github/running_scans/workflow_${{ github.run_id }}.txt"
-          git commit -m "Add running scans for workflow ${{ github.run_id }}"
-          git push origin main
+          if git commit -m "Add running scans for workflow ${{ github.run_id }}"; then
+            git push origin main || echo "Failed to push initial running scans file"
+          fi
 
       - name: Process ranges with ZMap
         if: steps.range_finder.outputs.ranges_found > 0
         run: |
+          # Helper function for git operations with improved error handling
+          push_changes() {
+            local description="$1"
+            local max_attempts=5
+            local attempt=1
+            local delay=10
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt to push changes for $description"
+              
+              # Fetch latest changes
+              git fetch origin main
+              
+              # Create new branch with timestamp to avoid conflicts
+              local branch_name="scan-$(date +%s)-${RANDOM}"
+              git checkout -b "$branch_name" origin/main
+              
+              # Stage all changes in zmap_results
+              git add zmap_results/
+              
+              # Check if there are changes to commit
+              if git diff --staged --quiet; then
+                echo "No changes to commit"
+                git checkout main
+                git branch -D "$branch_name"
+                return 0
+              fi
+              
+              # Try to commit and push
+              if git commit -m "Add scan results - $description"; then
+                if git push origin "$branch_name":main; then
+                  echo "Successfully pushed changes for $description"
+                  git checkout main
+                  git branch -D "$branch_name"
+                  return 0
+                fi
+              fi
+              
+              # If we get here, push failed
+              echo "Push attempt $attempt failed, cleaning up"
+              git checkout main
+              git branch -D "$branch_name"
+              
+              if [ $attempt -lt $max_attempts ]; then
+                echo "Waiting ${delay} seconds before next attempt..."
+                sleep $delay
+                delay=$((delay * 2))  # Exponential backoff
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+            
+            echo "Failed to push changes after $max_attempts attempts"
+            return 1
+          }
+
           # Helper function to process ZMap results
           process_zmap_results() {
             local result_file="$1"
@@ -123,99 +185,86 @@ jobs:
               }' > "$result_file"
           }
 
-          # Helper function for git operations
-          commit_changes() {
-            local cidr="$1"
-            local max_retries=5
-            local retry_count=0
-            
-            while [ $retry_count -lt $max_retries ]; do
-              git fetch origin main
-              
-              branch_name="scan-${RANDOM}"
-              git checkout -b "$branch_name" origin/main
-              
-              git add "$result_file" "zmap_results/summary.json"
-              
-              if git commit -m "Add ZMap scan results for $cidr"; then
-                if git push origin "$branch_name":main; then
-                  git checkout main
-                  git branch -D "$branch_name"
-                  return 0
-                fi
-              fi
-              
-              git checkout main
-              git branch -D "$branch_name"
-              sleep $((2 ** retry_count))
-              retry_count=$((retry_count + 1))
-            done
-            
-            echo "Failed to commit changes after $max_retries attempts"
-            return 1
-          }
-          
           # Read ranges to scan
           readarray -t ranges < <(jq -r '.[]' ranges_to_scan.json)
           
-          # Process each range
-          for cidr in "${ranges[@]}"; do
-            echo "Processing range: $cidr"
-            safe_name=$(echo "$cidr" | tr '/' '_')
-            result_file="zmap_results/${safe_name}.json"
+          # Process ranges in smaller batches to reduce git conflicts
+          BATCH_SIZE=5
+          TOTAL_RANGES=${#ranges[@]}
+          
+          for ((i = 0; i < TOTAL_RANGES; i += BATCH_SIZE)); do
+            BATCH_END=$((i + BATCH_SIZE))
+            [ $BATCH_END -gt $TOTAL_RANGES ] && BATCH_END=$TOTAL_RANGES
             
-            echo "Running ZMap scan for $cidr"
-            if timeout 360m docker run --rm --network=host -v "${{ github.workspace }}":/data \
-              sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
-              --cooldown-time=2 \
-              "$cidr" -o "/data/tmp_open_ips.csv"; then
+            echo "Processing batch $((i/BATCH_SIZE + 1)) (ranges $((i+1)) to $BATCH_END of $TOTAL_RANGES)"
+            
+            for ((j = i; j < BATCH_END; j++)); do
+              cidr="${ranges[j]}"
+              echo "Processing range: $cidr"
+              safe_name=$(echo "$cidr" | tr '/' '_')
+              result_file="zmap_results/${safe_name}.json"
               
-              if [ -s tmp_open_ips.csv ]; then
-                echo "Found open ports, processing results..."
-                process_zmap_results "$result_file" "$cidr"
+              if timeout 360m docker run --rm --network=host -v "${{ github.workspace }}":/data \
+                sec32/zmap zmap -M tcp_synscan -p 443 -B 100K \
+                --cooldown-time=2 \
+                "$cidr" -o "/data/tmp_open_ips.csv"; then
                 
-                total_ips=$(jq '.total_ips' "$result_file")
-                echo "Scan completed successfully for $cidr - Found $total_ips active hosts"
-                
+                if [ -s tmp_open_ips.csv ]; then
+                  echo "Found open ports, processing results..."
+                  process_zmap_results "$result_file" "$cidr"
+                  
+                  total_ips=$(jq '.total_ips' "$result_file")
+                  echo "Scan completed successfully for $cidr - Found $total_ips active hosts"
+                  
+                else
+                  echo "No open ports found for range: $cidr"
+                  echo "{
+                    \"range\": \"$cidr\",
+                    \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+                    \"total_ips\": 0,
+                    \"ips\": []
+                  }" > "$result_file"
+                fi
               else
-                echo "No open ports found for range: $cidr"
+                echo "ZMap scan failed for range: $cidr"
                 echo "{
                   \"range\": \"$cidr\",
                   \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+                  \"error\": \"scan_timeout\",
                   \"total_ips\": 0,
                   \"ips\": []
                 }" > "$result_file"
               fi
-            else
-              echo "ZMap scan failed for range: $cidr"
-              echo "{
-                \"range\": \"$cidr\",
-                \"scan_time\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
-                \"error\": \"scan_timeout\",
-                \"total_ips\": 0,
-                \"ips\": []
-              }" > "$result_file"
+              
+              rm -f tmp_open_ips.csv tmp_ips.json
+            done
+            
+            # Update summary.json with this batch
+            if [ ! -f "zmap_results/summary.json" ]; then
+              echo '{"scans":[], "last_updated": ""}' > "zmap_results/summary.json"
             fi
             
-            rm -f tmp_open_ips.csv tmp_ips.json
-            
-            if [ -f "$result_file" ]; then
-              if [ ! -f "zmap_results/summary.json" ]; then
-                echo '{"scans":[], "last_updated": ""}' > "zmap_results/summary.json"
+            for ((j = i; j < BATCH_END; j++)); do
+              cidr="${ranges[j]}"
+              safe_name=$(echo "$cidr" | tr '/' '_')
+              result_file="zmap_results/${safe_name}.json"
+              
+              if [ -f "$result_file" ]; then
+                jq --arg range "$cidr" \
+                   --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+                   --arg total "$(jq '.total_ips' "$result_file")" \
+                '.scans += [{
+                  range: $range,
+                  scan_time: $time,
+                  total_ips: ($total|tonumber)
+                }] | .last_updated = $time' "zmap_results/summary.json" > "zmap_results/summary.json.tmp" && \
+                mv "zmap_results/summary.json.tmp" "zmap_results/summary.json"
               fi
-              
-              jq --arg range "$cidr" \
-                 --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-                 --arg total "$(jq '.total_ips' "$result_file")" \
-              '.scans += [{
-                range: $range,
-                scan_time: $time,
-                total_ips: ($total|tonumber)
-              }] | .last_updated = $time' "zmap_results/summary.json" > "zmap_results/summary.json.tmp" && \
-              mv "zmap_results/summary.json.tmp" "zmap_results/summary.json"
-              
-              commit_changes "$cidr" || echo "Failed to push changes for $cidr"
-            fi
+            done
+            
+            # Push this batch of results
+            push_changes "Batch $((i/BATCH_SIZE + 1)) (ranges $((i+1)) to $BATCH_END)" || \
+              echo "Warning: Failed to push batch $((i/BATCH_SIZE + 1)), continuing with next batch"
           done
 
       - name: Cleanup running scans file
@@ -270,7 +319,7 @@ jobs:
             git add "$RUNNING_SCANS_FILE" || true
             
             if [ ${#INCOMPLETE_SCANS[@]} -gt 0 ]; then
-              git commit -m "Update running scans file - $(${#INCOMPLETE_SCANS[@]}) incomplete scans remain" || true
+              git commit -m "Update running scans file - ${#INCOMPLETE_SCANS[@]} incomplete scans remain" || true
             else
               git commit -m "Remove completed running scans file for workflow ${{ github.run_id }}" || true
             fi
