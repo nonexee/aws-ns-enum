@@ -221,12 +221,76 @@ jobs:
       - name: Cleanup running scans file
         if: always()
         run: |
-          git fetch origin main
-          git checkout main
-          rm -f ".github/running_scans/workflow_${{ github.run_id }}.txt"
-          git add ".github/running_scans/workflow_${{ github.run_id }}.txt"
-          git commit -m "Remove running scans for workflow ${{ github.run_id }}"
-          git push origin main || echo "Failed to cleanup running scans file"
+          # Function to verify scan completion
+          verify_scan() {
+            local cidr="$1"
+            local safe_name=$(echo "$cidr" | tr '/' '_')
+            local result_file="zmap_results/${safe_name}.json"
+            
+            # Check if result file exists and is valid
+            if [ -f "$result_file" ]; then
+              if jq -e . >/dev/null 2>&1 < "$result_file"; then
+                # File exists and is valid JSON
+                return 0
+              fi
+            fi
+            return 1
+          }
+
+          # Read our running scans file
+          RUNNING_SCANS_FILE=".github/running_scans/workflow_${{ github.run_id }}.txt"
+          if [ -f "$RUNNING_SCANS_FILE" ]; then
+            INCOMPLETE_SCANS=()
+            
+            # Check each CIDR in our running scans file
+            while IFS= read -r cidr; do
+              if [ -n "$cidr" ]; then
+                if ! verify_scan "$cidr"; then
+                  INCOMPLETE_SCANS+=("$cidr")
+                  echo "Warning: Scan for $cidr appears incomplete"
+                else
+                  echo "Verified completed scan for $cidr"
+                fi
+              fi
+            done < "$RUNNING_SCANS_FILE"
+            
+            # If we have incomplete scans, update the running scans file
+            if [ ${#INCOMPLETE_SCANS[@]} -gt 0 ]; then
+              echo "Some scans are incomplete. Updating running scans file..."
+              printf "%s\n" "${INCOMPLETE_SCANS[@]}" > "$RUNNING_SCANS_FILE.tmp"
+              mv "$RUNNING_SCANS_FILE.tmp" "$RUNNING_SCANS_FILE"
+            else
+              echo "All scans completed successfully. Removing running scans file..."
+              rm -f "$RUNNING_SCANS_FILE"
+            fi
+            
+            # Commit changes
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git add "$RUNNING_SCANS_FILE" || true
+            
+            if [ ${#INCOMPLETE_SCANS[@]} -gt 0 ]; then
+              git commit -m "Update running scans file - $(${#INCOMPLETE_SCANS[@]}) incomplete scans remain" || true
+            else
+              git commit -m "Remove completed running scans file for workflow ${{ github.run_id }}" || true
+            fi
+            
+            # Try to push changes, with retry logic
+            max_retries=3
+            retry_count=0
+            while [ $retry_count -lt $max_retries ]; do
+              if git pull --rebase origin main && git push origin main; then
+                break
+              fi
+              retry_count=$((retry_count + 1))
+              if [ $retry_count -lt $max_retries ]; then
+                echo "Push failed, retrying in 5 seconds..."
+                sleep 5
+              fi
+            done
+          else
+            echo "No running scans file found for this workflow"
+          fi
 
       - name: Trigger next batch if more ranges available
         if: steps.range_finder.outputs.ranges_found == inputs.batch_size
